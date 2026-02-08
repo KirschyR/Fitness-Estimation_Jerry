@@ -1,0 +1,296 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>CSV Viewer</title>
+  <style>
+    body{font-family:Arial; margin:0; height:100vh}
+    .container{display:flex; height:100vh}
+    #sidebar{width:320px; border-right:1px solid #ddd; padding:12px; box-sizing:border-box; overflow:auto}
+    #main{flex:1; padding:12px; box-sizing:border-box; overflow:auto}
+    #files{margin-top:8px}
+    table{border-collapse:collapse; width:100%}
+    td,th{border:1px solid #ccc;padding:6px; text-align:left}
+    .small{font-size:0.9em;color:#444}
+    .controls{margin-bottom:12px}
+    .controls label{display:block;margin:6px 0 3px}
+    .btn{display:inline-block;padding:6px 10px;background:#1976d2;color:#fff;border-radius:4px;text-decoration:none;cursor:pointer}
+  </style>
+</head>
+<body>
+  <h2>Outputs CSV Viewer</h2>
+  <div class="container">
+    <aside id="sidebar">
+      <div>
+        <div class="controls">
+          <label>Search files</label>
+          <input id="searchFiles" type="text" placeholder="filter filenames" style="width:100%" />
+          <label>Column name filter (substring)</label>
+          <input id="colFilter" type="text" placeholder="e.g. WT|" style="width:100%" />
+          <label>Age range</label>
+          <div><input id="ageMin" type="number" placeholder="min" style="width:45%" />
+          <input id="ageMax" type="number" placeholder="max" style="width:45%; float:right" /></div>
+          <div style="margin-top:8px"><button id="applyFilters" class="btn">Apply Filters</button>
+          <button id="clearFilters" class="btn" style="background:#666;margin-left:8px">Clear</button></div>
+        </div>
+        <div id="files">Loading files...</div>
+      </div>
+    </aside>
+    <main id="main">
+      <div id="table"></div>
+    </main>
+  </div>
+  <script>
+    let latestLoaded = { rows:null, headers:null, relpath:null };
+
+    async function loadFiles(){
+      const res = await fetch('/list');
+      const tree = await res.json();
+      const container = document.getElementById('files');
+      container.innerHTML='';
+      if(Object.keys(tree).length===0){ container.innerText='No files in outputs/'; return }
+      const root = document.createElement('div');
+      Object.keys(tree).forEach(week=>{
+        const weekDiv = document.createElement('div');
+        const h = document.createElement('a'); h.href='#'; h.className='small'; h.innerText = week;
+        // toggle week collapse
+        h.onclick = (e)=>{ e.preventDefault(); const next = h.nextElementSibling; if(next) next.style.display = (next.style.display==='none'?'':'none'); };
+        weekDiv.appendChild(h);
+        const states = tree[week];
+        const ulStates = document.createElement('ul');
+        Object.keys(states).forEach(state=>{
+          const liState = document.createElement('li');
+          // state header is clickable to toggle inline checkable file list
+          const strong = document.createElement('a'); strong.href='#'; strong.className='small'; strong.innerText = state;
+          strong.onclick = (e)=>{ e.preventDefault(); toggleStateFiles(week, state, states[state], liState); };
+          liState.appendChild(strong);
+          // do not list files here initially (user requested only second-level shown)
+          ulStates.appendChild(liState);
+        });
+        weekDiv.appendChild(ulStates);
+        root.appendChild(weekDiv);
+      });
+      container.appendChild(root);
+      // wire search box
+      document.getElementById('searchFiles').addEventListener('input', (e)=>{
+        const q = e.target.value.toLowerCase();
+        Array.from(container.querySelectorAll('li')).forEach(li=>{
+          const a = li.querySelector('a');
+          if(!a) return;
+          li.style.display = a.innerText.toLowerCase().includes(q)?'':'none';
+        });
+      });
+      document.getElementById('applyFilters').addEventListener('click', ()=>{ renderFiltered(); });
+      document.getElementById('clearFilters').addEventListener('click', ()=>{ document.getElementById('colFilter').value=''; document.getElementById('ageMin').value=''; document.getElementById('ageMax').value=''; renderFiltered(); });
+      // ensure placeholder removed (we will show files inline)
+      const side = document.getElementById('sidebar');
+      const existing = document.getElementById('stateFiles'); if(existing) existing.remove();
+    }
+
+    async function loadCSV(relpath){
+      try{
+        // encode each path segment but keep slashes
+        const parts = relpath.split('/').map(encodeURIComponent).join('/');
+        const url = '/files/' + parts;
+        const res = await fetch(url);
+        if(!res.ok){ alert('Failed to load file'); console.error('fetch failed', res); return }
+        const text = await res.text();
+        console.log('Loaded file', relpath, 'first200chars:\n', text.slice(0,200));
+        // split lines supporting CRLF, ignore empty lines
+        const lines = text.split(/\r?\n/).filter(l=>l.trim()!=='');
+        if(lines.length===0){ alert('Empty file'); return }
+        const rows = lines.map(r=> r.split(','));
+
+        const tbl = document.createElement('table');
+        const thead = document.createElement('thead');
+        const headerRow = document.createElement('tr');
+        rows[0].forEach(h=>{ const th = document.createElement('th'); th.innerText=h; headerRow.appendChild(th)});
+        thead.appendChild(headerRow); tbl.appendChild(thead);
+        const tbody = document.createElement('tbody');
+        for(let i=1;i<rows.length;i++){
+          const tr = document.createElement('tr');
+          rows[i].forEach(c=>{ const td = document.createElement('td'); td.innerText=c; tr.appendChild(td)});
+          tbody.appendChild(tr);
+        }
+        tbl.appendChild(tbody);
+
+        const tableContainer = document.getElementById('table');
+        if(tableContainer.firstChild) tableContainer.removeChild(tableContainer.firstChild);
+        tableContainer.appendChild(tbl);
+        latestLoaded = { rows: rows, headers: rows[0], relpath: relpath };
+        // cache single file
+        loadedFiles[relpath] = rows;
+
+        // auto-apply current filters
+        renderFiltered();
+
+      }catch(err){
+        console.error('Error loading CSV', relpath, err);
+        alert('Error loading CSV: see console');
+      }
+    }
+
+    function renderFiltered(){
+      if(!latestLoaded.rows) return;
+      const rows = latestLoaded.rows;
+      const headers = latestLoaded.headers;
+      const colFilter = document.getElementById('colFilter').value.trim().toLowerCase();
+      const ageMin = document.getElementById('ageMin').value;
+      const ageMax = document.getElementById('ageMax').value;
+
+      // determine which columns to show
+      const colIndices = headers.map((h,i)=> ({h: h, i:i})).filter(x=>{
+        if(colFilter==='') return true;
+        return String(x.h).toLowerCase().includes(colFilter);
+      }).map(x=>x.i);
+
+      const outTbl = document.createElement('table');
+      const thead = document.createElement('thead');
+      const hr = document.createElement('tr');
+      colIndices.forEach(ci=>{ const th=document.createElement('th'); th.innerText=headers[ci]; hr.appendChild(th); });
+      thead.appendChild(hr); outTbl.appendChild(thead);
+      const tbody = document.createElement('tbody');
+
+      for(let r=1;r<rows.length;r++){
+        const ageVal = rows[r][0];
+        if(ageVal===undefined) continue;
+        const ageNum = parseFloat(ageVal);
+        if(ageMin!=='' && !isNaN(parseFloat(ageMin)) && ageNum < parseFloat(ageMin)) continue;
+        if(ageMax!=='' && !isNaN(parseFloat(ageMax)) && ageNum > parseFloat(ageMax)) continue;
+        const tr = document.createElement('tr');
+        colIndices.forEach(ci=>{ const td=document.createElement('td'); td.innerText = rows[r][ci]===undefined? '': rows[r][ci]; tr.appendChild(td); });
+        tbody.appendChild(tr);
+      }
+      outTbl.appendChild(tbody);
+
+      const tableContainer = document.getElementById('table');
+      if(tableContainer.firstChild) tableContainer.removeChild(tableContainer.firstChild);
+      tableContainer.appendChild(outTbl);
+    }
+
+    // cache of loaded files by relpath
+    const loadedFiles = {};
+
+    // show files under a state with checkboxes, allow loading multiple
+    function showStateFiles(week, state, files){
+      const sf = document.getElementById('stateFiles');
+      sf.innerHTML = '';
+      const h = document.createElement('div'); h.innerHTML = `<strong>${week} / ${state}</strong>`;
+      sf.appendChild(h);
+      const ul = document.createElement('ul');
+      files.forEach(fname=>{
+        const li = document.createElement('li');
+        const cb = document.createElement('input'); cb.type='checkbox'; cb.checked=true; cb.value=fname; cb.id = 'cb_'+fname;
+        const lab = document.createElement('label'); lab.htmlFor = cb.id; lab.style.marginLeft='6px'; lab.innerText = fname;
+        li.appendChild(cb); li.appendChild(lab);
+        ul.appendChild(li);
+      });
+      sf.appendChild(ul);
+      const btn = document.createElement('button'); btn.className='btn'; btn.innerText='Load Selected';
+      btn.onclick = async ()=>{
+        const checked = Array.from(ul.querySelectorAll('input[type=checkbox]:checked')).map(i=>i.value);
+        const rels = checked.map(fn=> `${week}/${state}/${fn}`);
+        await loadMultiple(rels);
+      };
+      const clear = document.createElement('button'); clear.className='btn'; clear.style.background='#666'; clear.style.marginLeft='8px'; clear.innerText='Select None';
+      clear.onclick = ()=>{ ul.querySelectorAll('input[type=checkbox]').forEach(cb=>cb.checked=false); };
+      sf.appendChild(btn); sf.appendChild(clear);
+    }
+
+    async function loadMultiple(relpaths){
+      // load each file (if not cached)
+      for(const r of relpaths){
+        if(!loadedFiles[r]){
+          try{
+            const parts = r.split('/').map(encodeURIComponent).join('/');
+            const url = '/files/' + parts;
+            const res = await fetch(url);
+            if(!res.ok){ console.error('Failed fetch', r); continue }
+            const text = await res.text();
+            const lines = text.split(/\r?\n/).filter(l=>l.trim()!=='');
+            if(lines.length===0) { loadedFiles[r]=null; continue }
+            loadedFiles[r] = lines.map(l=>l.split(','));
+          }catch(e){ console.error('Error loading', r, e); }
+        }
+      }
+      // render selected
+      renderMultiple(relpaths.filter(r=>loadedFiles[r]));
+    }
+
+    // toggle inline state file checkbox list under the state li element
+    function toggleStateFiles(week, state, files, liState){
+      // if already expanded, collapse
+      const existing = liState.querySelector('.state-file-list');
+      if(existing){ existing.remove(); return }
+      const div = document.createElement('div'); div.className='state-file-list'; div.style.margin='8px 0 8px 12px';
+      const ul = document.createElement('ul');
+      files.forEach(fname=>{
+        const li = document.createElement('li'); li.style.listStyle='none';
+        const cb = document.createElement('input'); cb.type='checkbox'; cb.checked=true; cb.value=fname; cb.id = `cb_${week}_${state}_${fname}`;
+        const lab = document.createElement('label'); lab.htmlFor = cb.id; lab.style.marginLeft='6px'; lab.innerText = fname;
+        const a = document.createElement('a'); a.href='#'; a.innerText=' (view)'; a.style.marginLeft='8px';
+        a.onclick = (e)=>{ e.preventDefault(); loadCSV(`${week}/${state}/${fname}`); };
+        li.appendChild(cb); li.appendChild(lab); li.appendChild(a);
+        ul.appendChild(li);
+      });
+      div.appendChild(ul);
+      const btn = document.createElement('button'); btn.className='btn'; btn.innerText='Load Selected';
+      btn.onclick = async ()=>{
+        const checked = Array.from(div.querySelectorAll('input[type=checkbox]:checked')).map(i=>i.value);
+        const rels = checked.map(fn=> `${week}/${state}/${fn}`);
+        await loadMultiple(rels);
+      };
+      const clear = document.createElement('button'); clear.className='btn'; clear.style.background='#666'; clear.style.marginLeft='8px'; clear.innerText='Select None';
+      clear.onclick = ()=>{ div.querySelectorAll('input[type=checkbox]').forEach(cb=>cb.checked=false); };
+      div.appendChild(btn); div.appendChild(clear);
+      liState.appendChild(div);
+    }
+
+    function applyFiltersToRows(rows){
+      if(!rows || rows.length===0) return [];
+      const headers = rows[0];
+      const colFilter = document.getElementById('colFilter').value.trim().toLowerCase();
+      const ageMin = document.getElementById('ageMin').value;
+      const ageMax = document.getElementById('ageMax').value;
+      const colIndices = headers.map((h,i)=> ({h:h,i:i})).filter(x=>{
+        if(colFilter==='') return true;
+        return String(x.h).toLowerCase().includes(colFilter);
+      }).map(x=>x.i);
+      const outRows = [];
+      // header row
+      outRows.push(colIndices.map(i=> headers[i]));
+      for(let r=1;r<rows.length;r++){
+        const ageVal = rows[r][0];
+        if(ageVal===undefined) continue;
+        const ageNum = parseFloat(ageVal);
+        if(ageMin!=='' && !isNaN(parseFloat(ageMin)) && ageNum < parseFloat(ageMin)) continue;
+        if(ageMax!=='' && !isNaN(parseFloat(ageMax)) && ageNum > parseFloat(ageMax)) continue;
+        outRows.push(colIndices.map(i=> rows[r][i]===undefined? '': rows[r][i]));
+      }
+      return outRows;
+    }
+
+    function renderMultiple(relpaths){
+      const tableContainer = document.getElementById('table');
+      if(tableContainer.firstChild) tableContainer.removeChild(tableContainer.firstChild);
+      const wrapper = document.createElement('div');
+      relpaths.forEach(r=>{
+        const rows = loadedFiles[r];
+        if(!rows) return;
+        const filtered = applyFiltersToRows(rows);
+        const title = document.createElement('h4'); title.innerText = r; wrapper.appendChild(title);
+        const tbl = document.createElement('table');
+        const thead = document.createElement('thead'); const hr = document.createElement('tr');
+        filtered[0].forEach(h=>{ const th=document.createElement('th'); th.innerText=h; hr.appendChild(th); }); thead.appendChild(hr); tbl.appendChild(thead);
+        const tbody = document.createElement('tbody');
+        for(let i=1;i<filtered.length;i++){ const tr=document.createElement('tr'); filtered[i].forEach(c=>{ const td=document.createElement('td'); td.innerText=c; tr.appendChild(td)}); tbody.appendChild(tr); }
+        tbl.appendChild(tbody);
+        wrapper.appendChild(tbl);
+      });
+      tableContainer.appendChild(wrapper);
+    }
+
+    loadFiles();
+  </script>
+</body>
+</html>
