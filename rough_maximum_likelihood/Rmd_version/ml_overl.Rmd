@@ -1,0 +1,1482 @@
+---
+title: 'Fitness parameter estimation of a mosquito model'
+output: html_document
+date: "2024-11-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Simulate genotype trajectories for given parameters and vector x of starting frequencies over g generations. If effective_population_size=0, deterministic trajectories are simulated.
+
+```{r}
+evolve_overlapping <- function(
+  initial_genotype_freq,
+  remate_chance = 0.05,
+  effective_population_size, 
+  male_viability_fitness, 
+  female_viability_fitness, 
+  male_fecundity_fitness, 
+  female_fecundity_fitness, 
+  both_fecundity_fitness, 
+  male_mating_success, # assume same
+  max_week = 317,
+  eggs_per_female_that_reproduce = 25,
+  relative_competition_factor = 5,
+  low_density_growth_rate = 6,
+  drive_efficiency = 0.5  # Drive conversion efficiency: 0.5 = standard Mendelian, 0.7 = like test_mosquito_population
+) {
+  
+  # keep the genotype statistic data
+  genotype_statistic <- initial_genotype_freq
+  
+  population <- matrix(0, nrow = 9, ncol = 8)
+  colnames(population) <- c("age0", "age1", "age2", "age3", "age4", "age5", "age6", "age7")
+  rownames(population) <- c("female_dd", "female_dw", "female_ww",                      # row 1-3
+                            "male_dd",   "male_dw",   "male_ww",                        # row 4-6
+                            "female_stored_dd", "female_stored_dw", "female_stored_ww") # row 7-9
+  
+  # population
+  population[1:6, 1:8] = initial_genotype_freq[1:6, 1:8]
+  
+  # obtain values from the genotype vector
+  # freq_male_y    <- initial_genotype_freq[1]
+  # freq_male_w    <- initial_genotype_freq[2]
+  # freq_female_yy <- initial_genotype_freq[3]
+  # freq_female_yw <- initial_genotype_freq[4]
+  # freq_female_ww <- initial_genotype_freq[5]
+  
+  # record the population statistic every week
+  population_statistic <- list(population)
+  # i <- 2
+  # run simulation for `max_generation` cycles
+  for(i in (1:max_week)) {
+    population <- population_statistic[[i]]
+    
+    # first, obtain the genotype frequencies of adult individuals
+    freq_adult_female_dd <- sum(population["female_dd", 3:8]) / sum(population[1:3, 3:8])
+    freq_adult_female_dw <- sum(population["female_dw", 3:8]) / sum(population[1:3, 3:8])
+    freq_adult_female_ww <- sum(population["female_ww", 3:8]) / sum(population[1:3, 3:8])
+    freq_adult_male_dd   <- sum(population["male_dd",   3:5]) / sum(population[4:6, 3:5])
+    freq_adult_male_dw   <- sum(population["male_dw",   3:5]) / sum(population[4:6, 3:5])
+    freq_adult_male_ww   <- sum(population["male_ww",   3:5]) / sum(population[4:6, 3:5])
+    
+    # mate chances (sexual selection)
+    sexual_selection_by_female <- c(male_mating_success * freq_adult_male_dd,
+                                    freq_adult_male_dw,
+                                    freq_adult_male_ww)
+    
+    prob_dd_male_chosen_by_female <- sexual_selection_by_female[1] / sum(sexual_selection_by_female)
+    prob_dw_male_chosen_by_female <- sexual_selection_by_female[2] / sum(sexual_selection_by_female)
+    prob_ww_male_chosen_by_female <- sexual_selection_by_female[3] / sum(sexual_selection_by_female)
+    
+    # 这时候，可以更新female_stored部分
+    # 然后按这个计算fecundity and viability selection
+    # 某一年龄的female_stored部分，等于上一周上一年龄的female_store部分乘上(1-remate_chance)，
+    # 再加上这一周雄性按sexual selection加权的基因型频率
+    
+    # update stored sperm
+    # for females of age 2, they always select males
+    population["female_stored_dd", 3] <- prob_dd_male_chosen_by_female
+    population["female_stored_dw", 3] <- prob_dw_male_chosen_by_female
+    population["female_stored_ww", 3] <- prob_ww_male_chosen_by_female
+    
+    # for females of age 3-7, only a proportion (remate_chance) of them select new mates
+    # (otherwise, use previously stored sperm)
+    if (i == 1) {
+      population["female_stored_dd", 4:8] <- prob_dd_male_chosen_by_female
+      population["female_stored_dw", 4:8] <- prob_dw_male_chosen_by_female
+      population["female_stored_ww", 4:8] <- prob_ww_male_chosen_by_female
+    } else {
+      population["female_stored_dd", 4:8] <- 
+        (1 - remate_chance) * population_statistic[[i - 1]]["female_stored_dd", 3:7] + remate_chance * prob_dd_male_chosen_by_female
+      population["female_stored_dw", 4:8] <- 
+        (1 - remate_chance) * population_statistic[[i - 1]]["female_stored_dw", 3:7] + remate_chance * prob_dw_male_chosen_by_female
+      population["female_stored_ww", 4:8] <- 
+        (1 - remate_chance) * population_statistic[[i - 1]]["female_stored_ww", 3:7] + remate_chance * prob_ww_male_chosen_by_female
+    }
+    
+    # normalization
+    population[7:9, 3:8] <- apply(population[7:9, 3:8], 2, function(x) x / sum(x))
+    
+    # Drive conversion efficiency parameters
+    # e = drive_efficiency: probability that a dw heterozygote produces a 'd' gamete
+    # Standard Mendelian: e = 0.5
+    # With gene drive: e > 0.5 (e.g., 0.7 as in test_mosquito_population)
+    e <- drive_efficiency
+    h_to_w <- 1 - e  # probability of producing 'w' gamete from dw
+    
+    # fecundity selection (WITH DRIVE CONVERSION)
+    # Key changes from standard Mendelian:
+    # - dd × dw: offspring = e*dd + (1-e)*dw  (was 1/2 dd + 1/2 dw)
+    # - dw × dd: offspring = e*dd + (1-e)*dw  (was 1/2 dd + 1/2 dw)
+    # - dw × dw: offspring = e²*dd + 2*e*(1-e)*dw + (1-e)²*ww  (was 1/4 dd + 1/2 dw + 1/4 ww)
+    # - dw × ww: offspring = e*dw + (1-e)*ww  (was 1/2 dw + 1/2 ww)
+    # - ww × dw: offspring = e*dw + (1-e)*ww  (was 1/2 dw + 1/2 ww)
+    
+    offspring_dd <- eggs_per_female_that_reproduce * (
+        both_fecundity_fitness   * sum(population["female_dd", 3:8] * population["female_stored_dd", 3:8])       # dd female × dd sperm → 100% dd
+      + female_fecundity_fitness * sum(population["female_dd", 3:8] * population["female_stored_dw", 3:8]) * e   # dd female × dw sperm → e dd (drive in sperm)
+      + male_fecundity_fitness   * sum(population["female_dw", 3:8] * population["female_stored_dd", 3:8]) * e   # dw female × dd sperm → e dd (drive in egg)
+      +                            sum(population["female_dw", 3:8] * population["female_stored_dw", 3:8]) * e * e # dw female × dw sperm → e² dd
+    )
+    offspring_dw <- eggs_per_female_that_reproduce * (
+        female_fecundity_fitness * sum(population["female_dd", 3:8] * population["female_stored_dw", 3:8]) * h_to_w # dd female × dw sperm → (1-e) dw
+      + female_fecundity_fitness * sum(population["female_dd", 3:8] * population["female_stored_ww", 3:8])          # dd female × ww sperm → 100% dw
+      + male_fecundity_fitness   * sum(population["female_dw", 3:8] * population["female_stored_dd", 3:8]) * h_to_w # dw female × dd sperm → (1-e) dw
+      +                            sum(population["female_dw", 3:8] * population["female_stored_dw", 3:8]) * 2 * e * h_to_w # dw × dw → 2e(1-e) dw
+      +                            sum(population["female_dw", 3:8] * population["female_stored_ww", 3:8]) * e      # dw female × ww sperm → e dw (drive in egg)
+      + male_fecundity_fitness   * sum(population["female_ww", 3:8] * population["female_stored_dd", 3:8])          # ww female × dd sperm → 100% dw
+      +                            sum(population["female_ww", 3:8] * population["female_stored_dw", 3:8]) * e      # ww female × dw sperm → e dw (drive in sperm)
+    )
+    offspring_ww <- eggs_per_female_that_reproduce * (
+        sum(population["female_ww", 3:8] * population["female_stored_ww", 3:8])                           # ww × ww → 100% ww
+      + sum(population["female_ww", 3:8] * population["female_stored_dw", 3:8]) * h_to_w                  # ww female × dw sperm → (1-e) ww
+      + sum(population["female_dw", 3:8] * population["female_stored_ww", 3:8]) * h_to_w                  # dw female × ww sperm → (1-e) ww
+      + sum(population["female_dw", 3:8] * population["female_stored_dw", 3:8]) * h_to_w * h_to_w         # dw × dw → (1-e)² ww
+    )
+    
+    # sex differentiation
+    offspring_male_dd <- offspring_dd / 2
+    offspring_male_dw <- offspring_dw / 2
+    offspring_male_ww <- offspring_ww / 2
+    offspring_female_dd <- offspring_dd / 2
+    offspring_female_dw <- offspring_dw / 2
+    offspring_female_ww <- offspring_ww / 2
+    
+    # add new offspring to the population
+    offspring_males   <- c(offspring_male_dd,   offspring_male_dw,   offspring_male_ww)
+    offspring_females <- c(offspring_female_dd, offspring_female_dw, offspring_female_ww)
+    
+    population[1:6, 1] <- c(offspring_female_dd, offspring_female_dw, offspring_female_ww,
+                            offspring_male_dd,   offspring_male_dw,   offspring_male_ww)
+    
+    # update population matrix to the statistic
+    population_statistic[[i]] <- population
+    
+    # 这里得到了offspring的基因型分布，如果Ne=0，那就是期望值
+    # 它们的表型（基因型）会在间隔一周后体现在成虫里面
+    # 这时就可以进行最大似然估计
+    
+    ########################################################################
+    ########## INITIALIZE THE NEXT WEEK ####################################
+    ########################################################################
+    
+    new_population <- population
+    
+    # survival rates
+    male_survival_rates = c(2/3,1/2,0,0,0,0)
+    female_survival_rates = c(5/6,4/5,3/4,2/3,1/2,0)
+    
+    # age-based survival
+    for (j in 1:5) {
+      new_population[1:3, j+3] <- population[1:3, j+2] * female_survival_rates[j]
+      new_population[4:6, j+3] <- population[4:6, j+2] * male_survival_rates[j]
+    }
+    
+    # viability selection (age 1 to age 2)
+    # if effective population size is set, then simulate stochastic trajectories
+    # otherwise, simulate deterministic trajectories (representing no genetic drift)
+    new_adult_females <- c(population["female_dd", 2] * female_viability_fitness,
+                           population["female_dw", 2],
+                           population["female_ww", 2])
+    new_adult_males   <- c(population["male_dd", 2] * male_viability_fitness,
+                           population["male_dw", 2],
+                           population["male_ww", 2])
+    if (effective_population_size > 0) {
+      new_population[1:3, 3] <- (rmultinom(1, effective_population_size / 2, new_adult_females) 
+                             / (effective_population_size / 2)) * sum(new_adult_females)
+      new_population[4:6, 3] <- (rmultinom(1, effective_population_size / 2, new_adult_males) 
+                             / (effective_population_size / 2)) * sum(new_adult_males)
+    } else {
+      new_population[1:3, 3] <- new_adult_females
+      new_population[4:6, 3] <- new_adult_males
+    }
+    
+    # density-dependent growth (age 0 to age 1)
+    expected_competition <- eggs_per_female_that_reproduce + relative_competition_factor * 2 * 2/7
+    competition_ratio <- sum(population[1:6, 1] + relative_competition_factor * population[1:6, 2]) / expected_competition
+    relative_growth_rate <- low_density_growth_rate - competition_ratio * (low_density_growth_rate - 1)
+    new_larvae_survival_rate <- 2 * 2/7 * relative_growth_rate / eggs_per_female_that_reproduce
+    
+    new_population[1:6, 2] <- population[1:6, 1] * new_larvae_survival_rate
+    
+    new_population[7:9, ] <- 0
+    
+    population_statistic[[i+1]] <- new_population
+  }
+  
+  return(population_statistic)
+}
+```
+
+Generate test simulation data
+
+``` {r}
+# test
+initial_genotype_freq <- matrix(c(0, 0.085714286, 0, 0, 0, 0, 0, 0,
+                                  0, 0, 0, 0, 0, 0, 0, 0,
+                                  0, 0.2, 0.285714286, 0.238095238, 0.19047619, 0.142857143, 0.095238095, 0.047619048,
+                                  0, 0.085714286, 0, 0, 0, 0, 0, 0,
+                                  0, 0, 0, 0, 0, 0, 0, 0,
+                                  0, 0.2, 0.285714286, 0.19047619, 0.095238095, 0, 0, 0), nrow = 6, ncol = 8,byrow = TRUE)
+
+res <- evolve_overlapping(
+    initial_genotype_freq = initial_genotype_freq,
+    remate_chance = 0.05,
+    effective_population_size = 300, 
+    male_viability_fitness = 1, 
+    female_viability_fitness = 1, 
+    male_fecundity_fitness = 1, 
+    female_fecundity_fitness = 1, 
+    both_fecundity_fitness = 1, 
+    male_mating_success = 0.5, # assume same
+    max_week = 32,
+    eggs_per_female_that_reproduce = 25,
+    relative_competition_factor = 5,
+    low_density_growth_rate = 6,
+    drive_efficiency = 0.5  # Standard Mendelian (no drive conversion)
+)
+
+# Test with drive conversion (like test_mosquito_population.py)
+res_with_drive <- evolve_overlapping(
+    initial_genotype_freq = initial_genotype_freq,
+    remate_chance = 0.05,
+    effective_population_size = 300, 
+    male_viability_fitness = 0.8,   # dd has fitness cost
+    female_viability_fitness = 0.8, # dd has fitness cost
+    male_fecundity_fitness = 1, 
+    female_fecundity_fitness = 1, 
+    both_fecundity_fitness = 1, 
+    male_mating_success = 1,
+    max_week = 32,
+    eggs_per_female_that_reproduce = 25,
+    relative_competition_factor = 5,
+    low_density_growth_rate = 6,
+    drive_efficiency = 0.7  # Gene drive: 70% of gametes from dw carry 'd' (like test_mosquito_population)
+)
+```
+
+Compare drive vs no-drive simulation results
+
+```{r}
+# Helper function to extract d allele frequency over time
+get_d_allele_freq <- function(pop_stat) {
+  sapply(pop_stat, function(pop) {
+    total_dd <- sum(pop[c("female_dd", "male_dd"), 3:8])
+    total_dw <- sum(pop[c("female_dw", "male_dw"), 3:8])
+    total_ww <- sum(pop[c("female_ww", "male_ww"), 3:8])
+    total <- total_dd + total_dw + total_ww
+    if (total > 0) {
+      (2 * total_dd + total_dw) / (2 * total)  # Allele frequency
+    } else {
+      NA
+    }
+  })
+}
+
+# Compare trajectories
+freq_no_drive <- get_d_allele_freq(res)
+freq_with_drive <- get_d_allele_freq(res_with_drive)
+
+# Plot comparison
+plot(1:length(freq_no_drive), freq_no_drive, type = "l", col = "blue", 
+     ylim = c(0, 1), xlab = "Week", ylab = "Drive allele (d) frequency",
+     main = "Gene Drive vs Standard Mendelian Inheritance")
+lines(1:length(freq_with_drive), freq_with_drive, col = "red")
+legend("topright", legend = c("No drive (e=0.5)", "With drive (e=0.7)"), 
+       col = c("blue", "red"), lty = 1)
+```
+
+Log-likelihood function
+
+``` {r}
+# Log-maximum-likelihood function
+
+# rho.m <- function(x,p,n) {
+#   
+#   x.1 <- x*n
+#   x.2 <- (1-x)*n
+#   
+#   #log.a <- log(n+1)
+#   log.a <- log(n)-log(1-(p^n+(1-p)^n)/2)
+#   
+#   r <- log.a+lgamma(n+1)-lgamma(x.1+1)-lgamma(x.2+1)+log(p^x.1)+log((1-p)^x.2)
+#   
+#   return(r)
+# }
+
+# probability density of the observed genotype frequencies
+# based on the expected genotype frequencies p.x, p.y
+rho <- function(observed,expected,n) {
+  
+  x.1 <- observed[1]*n
+  x.2 <- observed[2]*n
+  x.3 <- observed[3]*n
+  p.x <- expected[1]
+  p.y <- expected[2]
+  
+  #log.a <- log(n+1) + log(n+2) - log(2)
+  log.a <- 2*log(n)-log(1+(p.x^n+p.y^n+(1-p.x-p.y)^n)/6-((1-p.x)^n+(1-p.y)^n+(p.x+p.y)^n)/2)
+  
+  r <-  log.a +
+    lgamma(n+1)-lgamma(x.1+1)-lgamma(x.2+1)-lgamma(x.3+1) +
+    log(p.x^x.1)+log(p.y^x.2)+log((1-(p.x+p.y))^x.3) 
+  
+  return(r)
+}
+
+logL <- function(f,population_statistic,mode) {
+  
+  # f: optimization parameters (important!)
+  # population_statistic: table with observed genotype numbers from single cage
+  
+  male_viability_fitness <- 1
+  female_viability_fitness <- 1
+  male_fecundity_fitness <- 1
+  female_fecundity_fitness <- 1
+  both_fecundity_fitness <- 1
+  male_mating_success <- 1
+  remate_chance <- 0.05
+  # beta  <- 1
+  
+  # full model 
+  
+  if(mode==1) { 
+    effective_population_size <- f[1] 
+    male_viability_fitness <- f[2]
+    female_viability_fitness <- f[3]
+    male_fecundity_fitness <- f[4]
+    female_fecundity_fitness <- f[5]
+    both_fecundity_fitness <- f[6]
+    male_mating_success <- f[7]
+    # beta  <- f[8]
+  }
+  
+  # sexual selection only
+  
+  if(mode==2) { 
+    effective_population_size   <- f[1] 
+    male_mating_success <- f[2]
+    # beta  <- f[3]
+  }
+  
+  # viability selection only
+  
+  if(mode==3) { 
+    effective_population_size <- f[1] 
+    male_viability_fitness <- f[2]
+    female_viability_fitness <- f[3]
+  }
+  
+  # fecundity selection only
+  
+  if(mode==4) { 
+    effective_population_size <- f[1] 
+    male_fecundity_fitness <- f[2]
+    female_fecundity_fitness <- f[3]
+    both_fecundity_fitness <- f[4]
+  }
+  
+  # minimal model 1
+  
+  if(mode==5) { 
+    effective_population_size <- f[1] 
+    male_viability_fitness <- f[2]
+    female_viability_fitness <- male_viability_fitness
+    male_mating_success <- f[3]
+  }
+  
+  # minimal model 2
+  
+  if(mode==6) { 
+    effective_population_size <- f[1] 
+    male_fecundity_fitness <- f[2]
+    female_fecundity_fitness <- male_fecundity_fitness
+    both_fecundity_fitness <- male_fecundity_fitness*female_fecundity_fitness
+    male_mating_success <- f[3]
+  }
+  
+  # simplistic fecundity model
+  
+  if(mode==7) { 
+    effective_population_size <- f[1] 
+    male_fecundity_fitness <- f[2]
+    female_fecundity_fitness <- male_fecundity_fitness
+    both_fecundity_fitness <- male_fecundity_fitness*female_fecundity_fitness
+  }
+  
+  # multiplicative fecundity selection only
+  
+  if(mode==8) { 
+    effective_population_size <- f[1] 
+    male_fecundity_fitness <- f[2]
+    female_fecundity_fitness <- f[3]
+    both_fecundity_fitness <- male_fecundity_fitness*female_fecundity_fitness
+  }
+  
+  l <- 0
+  
+  # 对population_statistic的处理
+  # population_statistic是一个table，里面每一个元素都是一个matrix
+  # 像下面这样定义：
+  # population <- matrix(0, nrow = 9, ncol = 8)
+  # colnames(population) <- c("age0", "age1", "age2", "age3", "age4", "age5", "age6", "age7")
+  # rownames(population) <- c("female_dd", "female_dw", "female_ww",                      # row 1-3
+  #                           "male_dd",   "male_dw",   "male_ww",                        # row 4-6
+  #                           "female_stored_dd", "female_stored_dw", "female_stored_ww") # row 7-9
+  
+  # 这里，"female_stored_dd", "female_stored_dw", "female_stored_ww"是模拟过程中按照remate_chance计算的
+  # 实际估计的时候我们并不知道，只能重新根据观测到的基因型比例来推算
+  
+  # 此外，第n周的情况只能在第n+2周才知道，因为只track成虫表型（或基因型）
+  # 这里使用最简单的办法，就是在成虫里面，等比例地扣除掉之前的成虫，假定剩下的都是新的成虫
+  
+  # 注意，假定后续的年龄分布都是未知的
+  # 只能用第一代的年龄分布推后面的！
+  
+  # 假定线性死亡，先获得观测的新一代情况
+  # 建立一个空矩阵来存储
+  observed_new_adult_genotype_frequencies <- matrix(0, nrow = length(population_statistic), ncol = 6)
+  colnames(observed_new_adult_genotype_frequencies) <- c("female_dd", "female_dw", "female_ww", 
+                                                         "male_dd",   "male_dw",   "male_ww")
+  
+  # 初始化第一行
+  observed_new_adult_genotype_frequencies[1,] <- c(rowSums(population_statistic[[1]][1:3, 3:8]) / sum(rowSums(population_statistic[[1]][1:3, 3:8])),
+                                                   rowSums(population_statistic[[1]][4:6, 3:8]) / sum(rowSums(population_statistic[[1]][4:6, 3:8])))
+  
+  # 此外，还要更新female_stored部分
+  # 这里是直接假定按remate_chance进行替换，没有考虑抽样
+  # 这部分数据会直接覆盖population_statistic
+  # 所以先备份一下
+  # 年龄也要按期望的更新
+  population_statistic_backup <- population_statistic
+  
+  for (t in (2:length(population_statistic))) {
+    this <- t
+    prev <- t-1
+    
+    #### Definition of population:
+    # population <- matrix(0, nrow = 9, ncol = 8)
+    # colnames(population) <- c("age0", "age1", "age2", "age3", "age4", "age5", "age6", "age7")
+    # rownames(population) <- c("female_dd", "female_dw", "female_ww",                      # row 1-3
+    #                           "male_dd",   "male_dw",   "male_ww",                        # row 4-6
+    #                           "female_stored_dd", "female_stored_dw", "female_stored_ww") # row 7-9
+    
+    #### prev的处理
+    #### observed genotype frequencies in generation t-2
+    population <- population_statistic[[prev]]
+    
+    # first, obtain the genotype frequencies of adult individuals
+    freq_adult_female_dd <- sum(population["female_dd", 3:8]) / sum(population[1:3, 3:8])
+    freq_adult_female_dw <- sum(population["female_dw", 3:8]) / sum(population[1:3, 3:8])
+    freq_adult_female_ww <- sum(population["female_ww", 3:8]) / sum(population[1:3, 3:8])
+    freq_adult_male_dd   <- sum(population["male_dd",   3:5]) / sum(population[4:6, 3:5])
+    freq_adult_male_dw   <- sum(population["male_dw",   3:5]) / sum(population[4:6, 3:5])
+    freq_adult_male_ww   <- sum(population["male_ww",   3:5]) / sum(population[4:6, 3:5])
+    
+    # mate chances (sexual selection)
+    sexual_selection_by_female <- c(male_mating_success * freq_adult_male_dd,
+                                    freq_adult_male_dw,
+                                    freq_adult_male_ww)
+    
+    prob_dd_male_chosen_by_female <- sexual_selection_by_female[1] / sum(sexual_selection_by_female)
+    prob_dw_male_chosen_by_female <- sexual_selection_by_female[2] / sum(sexual_selection_by_female)
+    prob_ww_male_chosen_by_female <- sexual_selection_by_female[3] / sum(sexual_selection_by_female)
+    
+    # 这时候，可以更新female_stored部分
+    # 然后按这个计算fecundity and viability selection
+    # 某一年龄的female_stored部分，等于上一周上一年龄的female_store部分乘上(1-remate_chance)，
+    # 再加上这一周雄性按sexual selection加权的基因型频率
+    
+    # update stored sperm
+    # for females of age 2, they always select males
+    population["female_stored_dd", 3] <- prob_dd_male_chosen_by_female
+    population["female_stored_dw", 3] <- prob_dw_male_chosen_by_female
+    population["female_stored_ww", 3] <- prob_ww_male_chosen_by_female
+    
+    # for females of age 3-7, only a proportion (remate_chance) of them select new mates
+    # (otherwise, use previously stored sperm)
+    # 注意，这里是直接假定按remate_chance进行替换，没有考虑抽样
+    if (prev == 1) {
+      population["female_stored_dd", 4:8] <- prob_dd_male_chosen_by_female
+      population["female_stored_dw", 4:8] <- prob_dw_male_chosen_by_female
+      population["female_stored_ww", 4:8] <- prob_ww_male_chosen_by_female
+    } else {
+      population["female_stored_dd", 4:8] <- 
+        (1 - remate_chance) * population_statistic[[prev - 1]]["female_stored_dd", 3:7] + remate_chance * prob_dd_male_chosen_by_female
+      population["female_stored_dw", 4:8] <- 
+        (1 - remate_chance) * population_statistic[[prev - 1]]["female_stored_dw", 3:7] + remate_chance * prob_dw_male_chosen_by_female
+      population["female_stored_ww", 4:8] <- 
+        (1 - remate_chance) * population_statistic[[prev - 1]]["female_stored_ww", 3:7] + remate_chance * prob_ww_male_chosen_by_female
+    }
+    
+    # normalization
+    population[7:9, 3:8] <- apply(population[7:9, 3:8], 2, function(x) x / sum(x))
+    
+    # update population matrix to the statistic
+    population_statistic[[prev]] <- population
+    
+    ########################################################################
+    ########## INITIALIZE THE NEXT WEEK ####################################
+    ########################################################################
+    
+    # fecundity selection
+    # 这里需要用到推测的年龄分布
+    
+    # 用第(n-2)周和第(n-1)周推第n周的年龄分布
+    # 第(n-2)周产生的后代会反映在第n周
+    # 在这里，只更新第(n-1)周的年龄分布
+    
+    # age-based survival rates
+    male_survival_rates = c(2/3,1/2,0,0,0,0)
+    female_survival_rates = c(5/6,4/5,3/4,2/3,1/2,0)
+    
+    # 初始化新一代的预测
+    expected_next_population_after_death <- population
+    
+    # 更新下一代的老成虫年龄分布
+    # age-based survival
+    # 注意，这是预测的
+    # 从第2代开始，都没有确切的年龄分布
+    for (j in 1:5) {
+      expected_next_population_after_death[1:3, j+3] <- population[1:3, j+2] * female_survival_rates[j]
+      expected_next_population_after_death[4:6, j+3] <- population[4:6, j+2] * male_survival_rates[j]
+    }
+    
+    expected_next_population_after_death[1:6, 3] <- 0
+    
+    # 接下来需要对比老成虫年龄分布和实际的基因型分布
+    # 只需要做差，就能知道新生代的基因型分布
+    expected_female_population_size_by_genotype   <- rowSums(expected_next_population_after_death[1:3, 4:8])
+    expected_male_population_size_by_genotype     <- rowSums(expected_next_population_after_death[4:6, 4:8])
+    
+    # 而实际的基因型分布如下
+    # 注意，在实际实验中，基因型按年龄的分布是不可见的
+    # 这里只能取各个年龄的和！
+    observed_female_population_size_by_genotype   <- rowSums(population_statistic[[this]][1:3, 3:8])
+    observed_male_population_size_by_genotype     <- rowSums(population_statistic[[this]][4:6, 3:8])
+    
+    # 获得新生代的基因型分布（作差）
+    inferred_female_population_size_in_age_2 <- 
+      observed_female_population_size_by_genotype - expected_female_population_size_by_genotype
+    inferred_male_population_size_in_age_2   <- 
+      observed_male_population_size_by_genotype   - expected_male_population_size_by_genotype
+    
+    # 更新到下一周的population_statistic中去
+    population_statistic[[this]][1:6, 4:8] <- expected_next_population_after_death[1:6, 4:8]
+    population_statistic[[this]][1:6, 3]   <- t(c(inferred_female_population_size_in_age_2, inferred_male_population_size_in_age_2))
+    
+    # normalization
+    inferred_female_population_size_in_age_2 <- 
+      sapply(inferred_female_population_size_in_age_2, function(x) x / sum(inferred_female_population_size_in_age_2))
+    inferred_male_population_size_in_age_2 <- 
+      sapply(inferred_male_population_size_in_age_2,   function(x) x / sum(inferred_male_population_size_in_age_2))
+    
+    # normalize之后存入observed矩阵里面去
+    observed_new_adult_genotype_frequencies[this,] <- t(c(inferred_female_population_size_in_age_2, inferred_male_population_size_in_age_2))
+  }
+  
+  ########################################################################
+  ################### 接下来是用stored来获得预期的情况 ###################
+  ################### 这里的population_statistic已经被更新了 #############
+  ################### 建立一个空矩阵来存储 ###############################
+  ########################################################################
+  
+  expected_new_adult_genotype_frequencies <- matrix(0, nrow = length(population_statistic), ncol = 6)
+  colnames(expected_new_adult_genotype_frequencies) <- c("female_dd", "female_dw", "female_ww", 
+                                                         "male_dd",   "male_dw",   "male_ww")
+  
+  for (t in (3:length(population_statistic))) {
+    # 用第(t-2)代的基因型分布来推第t代的基因型分布
+    this <- t
+    prev <- t-2
+    population <- population_statistic[[prev]]
+    
+    newborn_dd <- 1 * (
+      both_fecundity_fitness   * sum(population["female_dd", 3:8] * population["female_stored_dd", 3:8])     # dd female cross dd stored sperm
+      + female_fecundity_fitness * sum(population["female_dd", 3:8] * population["female_stored_dw", 3:8]) / 2 # dd female cross dw stored sperm (1/2)
+      + male_fecundity_fitness   * sum(population["female_dw", 3:8] * population["female_stored_dd", 3:8]) / 2 # dw female cross dd stored sperm (1/2)
+      +                            sum(population["female_dw", 3:8] * population["female_stored_dw", 3:8]) / 4 # dw female cross dw stored sperm (1/4)
+    )
+    newborn_dw <- 1 * (
+      female_fecundity_fitness * sum(population["female_dd", 3:8] * population["female_stored_dw", 3:8]) / 2 # dd female cross dw stored sperm (1/2)
+      + female_fecundity_fitness * sum(population["female_dd", 3:8] * population["female_stored_ww", 3:8])     # dd female cross ww stored sperm
+      + male_fecundity_fitness   * sum(population["female_dw", 3:8] * population["female_stored_dd", 3:8]) / 2 # dw female cross dd stored sperm (1/2)
+      +                            sum(population["female_dw", 3:8] * population["female_stored_dw", 3:8]) / 2 # dw female cross dw stored sperm (1/2)
+      +                            sum(population["female_dw", 3:8] * population["female_stored_ww", 3:8]) / 2 # dw female cross ww stored sperm (1/2)
+      + male_fecundity_fitness   * sum(population["female_ww", 3:8] * population["female_stored_dd", 3:8])     # ww female cross dd stored sperm
+      +                            sum(population["female_ww", 3:8] * population["female_stored_dw", 3:8]) / 2 # ww female cross dw stored sperm (1/2)
+    )
+    newborn_ww <- 1 * (
+      sum(population["female_ww", 3:8] * population["female_stored_ww", 3:8])     # ww female cross ww stored sperm
+      + sum(population["female_ww", 3:8] * population["female_stored_dw", 3:8]) / 2 # ww female cross dw stored sperm (1/2)
+      + sum(population["female_dw", 3:8] * population["female_stored_ww", 3:8]) / 2 # dw female cross ww stored sperm (1/2)
+      + sum(population["female_dw", 3:8] * population["female_stored_dw", 3:8]) / 4 # dw female cross dw stored sperm (1/4)
+    )
+    
+    # sex differentiation
+    newborn_male_dd   <- newborn_dd / 2
+    newborn_male_dw   <- newborn_dw / 2
+    newborn_male_ww   <- newborn_ww / 2
+    newborn_female_dd <- newborn_dd / 2
+    newborn_female_dw <- newborn_dw / 2
+    newborn_female_ww <- newborn_ww / 2
+    
+    # viability selection
+    new_adult_females <- c(newborn_female_dd * female_viability_fitness,
+                           newborn_female_dw,
+                           newborn_female_ww)
+    new_adult_males   <- c(newborn_male_dd * male_viability_fitness,
+                           newborn_male_dw,
+                           newborn_male_ww)
+    
+    # normalization
+    new_adult_females <- sapply(new_adult_females, function(x) x / sum(new_adult_females))
+    new_adult_males   <- sapply(new_adult_males,   function(x) x / sum(new_adult_males))
+    
+    # 更新到expected_new_adult_genotype_frequencies中去
+    expected_new_adult_genotype_frequencies[this,] <- c(new_adult_females, new_adult_males)
+    
+    # 计算
+    l <- l + 
+      rho(observed_new_adult_genotype_frequencies[t,1:3],
+          expected_new_adult_genotype_frequencies[t,1:3],
+          effective_population_size/2) + 
+      rho(observed_new_adult_genotype_frequencies[t,4:6],
+          expected_new_adult_genotype_frequencies[t,4:6],
+          effective_population_size/2)
+  }
+  
+  return(list(l,population_statistic,expected_new_adult_genotype_frequencies,observed_new_adult_genotype_frequencies,
+              sum((observed_new_adult_genotype_frequencies[3:length(population_statistic),] -
+                    expected_new_adult_genotype_frequencies[3:length(population_statistic),])^2 /
+                    expected_new_adult_genotype_frequencies[3:length(population_statistic),])))  
+}
+```
+
+输出函数
+``` {r}
+# 仅输出logL
+logL_only <- function(f,population_statistic,mode) {
+  return(logL(f,population_statistic,mode)[[1]])
+}
+
+# 仅输出拟合优度
+fit_only <- function(f,population_statistic,mode) {
+  return(logL(c(3000,f),population_statistic,mode)[[5]])
+}
+
+```
+
+Test:
+
+```{r}
+testval <- logL(c(300,1,1,1,1,1,0.5),res,1)
+testval[[1]]
+sum((testval[[4]][4:10,] - testval[[3]][4:10,])^2 / testval[[3]][4:10,])
+
+testval2 <- logL(c(300,1,1,1,1,1,0.3),res,1)
+testval2[[1]]
+sum((testval2[[4]][4:10,] - testval2[[3]][4:10,])^2 / testval2[[3]][4:10,])
+
+res <- evolve_overlapping(
+    initial_genotype_freq = initial_genotype_freq,
+    remate_chance = 0.05,
+    effective_population_size = 0, 
+    male_viability_fitness = 1, 
+    female_viability_fitness = 1, 
+    male_fecundity_fitness = 0.6, 
+    female_fecundity_fitness = 0.8, 
+    both_fecundity_fitness = 0.48, 
+    male_mating_success = 1, # assume same
+    max_week = 32,
+    eggs_per_female_that_reproduce = 25,
+    relative_competition_factor = 5,
+    low_density_growth_rate = 6
+)
+
+testval <- logL(c(300,0.6,0.8),res,8)
+testval[[1]]
+sum((testval[[4]][3:10,] - testval[[3]][3:10,])^2 / testval[[3]][3:10,])
+
+
+# 拟合优度检验通过
+```
+
+TODO:
+
+- 完成Figure3
+- 试一下Figure4
+- 试一下Figure5
+
+Helper function for calculating CI based on FI:
+<https://stats.stackexchange.com/questions/27033/in-r-given-an-output-from-optim-with-a-hessian-matrix-how-to-calculate-paramet>
+
+```{r}
+calculate.ci <-function(my.hessian){
+  if (det(my.hessian)==0){
+    return(NA)
+  }
+  fisher <- solve(c(-1) * my.hessian)
+  sigma_estimate <- sqrt(diag(fisher))
+  return(sigma_estimate*1.96)
+}
+```
+
+Calculate MLE statistics for simulated model (viability selection only)
+
+```{r}
+
+n.e <- 1000
+# N <- 1000
+
+v.m <- 0.6
+v.f <- 0.8
+f.m <- 1
+f.f <- 1
+f.b <- 1
+alpha <- 1
+
+# test
+initial_genotype_freq <- matrix(c(0, 0, 0.085714286, 0, 0, 0, 0, 0,
+                                  0, 0, 0, 0, 0, 0, 0, 0,
+                                  0, 0.285714286, 0.2, 0.238095238, 0.19047619, 0.142857143, 0.095238095, 0.047619048,
+                                  0, 0, 0.085714286, 0, 0, 0, 0, 0,
+                                  0, 0, 0, 0, 0, 0, 0, 0,
+                                  0, 0.285714286, 0.2, 0.19047619, 0.095238095, 0, 0, 0), nrow = 6, ncol = 8,byrow = TRUE)
+
+set.seed(826)
+
+MLE.list.m <- data.frame(c=numeric(),alpha=numeric(),l=numeric())
+MLE.list.v <- data.frame(c=numeric(),v.m=numeric(),v.f=numeric(),l=numeric())
+MLE.list.f <- data.frame(c=numeric(),f.m=numeric(),f.f=numeric(),l=numeric())
+
+fit.list.m <- data.frame(c=numeric(),alpha=numeric(),l=numeric())
+fit.list.v <- data.frame(c=numeric(),v.m=numeric(),v.f=numeric(),l=numeric())
+fit.list.f <- data.frame(c=numeric(),f.m=numeric(),f.f=numeric(),l=numeric())
+
+# for(i in (1:200)) {
+for(i in (1:5)) {
+
+  res <- evolve_overlapping(
+    initial_genotype_freq = initial_genotype_freq,
+    remate_chance = 0.05,
+    # effective_population_size = 0, 
+    effective_population_size = n.e, 
+    male_viability_fitness = v.m, 
+    female_viability_fitness = v.f, 
+    male_fecundity_fitness = f.m, 
+    female_fecundity_fitness = f.f, 
+    both_fecundity_fitness = f.b, 
+    male_mating_success = alpha, # assume same
+    max_week = 10,
+    eggs_per_female_that_reproduce = 25,
+    relative_competition_factor = 5,
+    low_density_growth_rate = 6
+  )
+  # N.sim <- N*x.sim
+
+  # estimate under viability only model
+  
+  p.lower <- c(500, 0.01, 0.01)
+  p.upper <- c(2000, 1.0, 1.0)
+  p.start <- c(1000,  0.5, 0.5)
+  
+  p2.lower <- c(0.01, 0.01)
+  p2.upper <- c(1.0, 1.0)
+  p2.start <- c(0.5, 0.5)
+
+  MLE.sim.v  <- optim(p.start,logL_only, method="L-BFGS-B",control=list(fnscale=-1), lower=p.lower, upper=p.upper, mode=3, population_statistic=res)
+  MLE.list.v <- rbind(MLE.list.v,data.frame(c=MLE.sim.v$par[1],v.m=MLE.sim.v$par[2],v.f=MLE.sim.v$par[3],l=MLE.sim.v$value))
+  
+  fit.sim.v  <- optim(p.start,fit_only, method="L-BFGS-B",control=list(fnscale=1), lower=p2.lower, upper=p2.upper, mode=3, population_statistic=res)
+  fit.list.v <- rbind(fit.list.v,data.frame(v.m=fit.sim.v$par[1],v.f=fit.sim.v$par[2],chi=fit.sim.v$value))
+}
+
+mean.MLE.v <- c(mean(MLE.list.v$c),mean(MLE.list.v$v.m),mean(MLE.list.v$v.f),mean(MLE.list.v$l))
+sd.MLE.v   <- c(sd(MLE.list.v$c),sd(MLE.list.v$v.m),sd(MLE.list.v$v.f),sd(MLE.list.v$l))
+
+mean.fit.v <- c(mean(fit.list.v$v.m),mean(fit.list.v$v.f),mean(fit.list.v$chi))
+sd.fit.v   <- c(sd(fit.list.v$v.m),sd(fit.list.v$v.f),sd(fit.list.v$chi))
+
+print(round(mean.MLE.v,digits=3))
+print(round(sd.MLE.v,digits=3))
+print(round(mean.fit.v,digits=3))
+print(round(sd.fit.v,digits=3))
+```
+
+Calculate MLE statistics for simulated model (fecundity selection only)
+
+```{r}
+
+n.e <- 1000
+# N <- 1000
+
+v.m <- 1
+v.f <- 1
+f.m <- 0.6
+f.f <- 0.8
+f.b <- f.m * f.f
+alpha <- 1
+
+# for(i in (1:200)) {
+for(i in (1:5)) {
+
+  res <- evolve_overlapping(
+    initial_genotype_freq = initial_genotype_freq,
+    remate_chance = 0.05,
+    # effective_population_size = 0, 
+    effective_population_size = n.e, 
+    male_viability_fitness = v.m, 
+    female_viability_fitness = v.f, 
+    male_fecundity_fitness = f.m, 
+    female_fecundity_fitness = f.f, 
+    both_fecundity_fitness = f.b, 
+    male_mating_success = alpha, # assume same
+    max_week = 10,
+    eggs_per_female_that_reproduce = 25,
+    relative_competition_factor = 5,
+    low_density_growth_rate = 6
+  )
+  # N.sim <- N*x.sim
+
+  # estimate under fecundity only model
+  
+  p.lower <- c(500, 0.01, 0.01)
+  p.upper <- c(2000, 1.0, 1.0)
+  p.start <- c(1000,  0.5, 0.5)
+  
+  p2.lower <- c(0.01, 0.01)
+  p2.upper <- c(1.0, 1.0)
+  p2.start <- c(0.5, 0.5)
+
+  MLE.sim.f  <- optim(p.start,logL_only, method="L-BFGS-B",control=list(fnscale=-1), lower=p.lower, upper=p.upper, mode=8, population_statistic=res)
+  MLE.list.f <- rbind(MLE.list.f,data.frame(c=MLE.sim.f$par[1],f.m=MLE.sim.f$par[2],f.f=MLE.sim.f$par[3],l=MLE.sim.f$value))
+  
+  fit.sim.f  <- optim(p.start,fit_only, method="L-BFGS-B",control=list(fnscale=1), lower=p2.lower, upper=p2.upper, mode=8, population_statistic=res)
+  fit.list.f <- rbind(fit.list.f,data.frame(f.m=fit.sim.f$par[1],f.f=fit.sim.f$par[2],chi=fit.sim.f$value))
+}
+
+mean.MLE.f <- c(mean(MLE.list.f$c),mean(MLE.list.f$f.m),mean(MLE.list.f$f.f),mean(MLE.list.f$l))
+sd.MLE.f   <- c(sd(MLE.list.f$c),sd(MLE.list.f$f.m),sd(MLE.list.f$f.f),sd(MLE.list.f$l))
+
+mean.fit.f <- c(mean(fit.list.f$f.m),mean(fit.list.f$f.f),mean(fit.list.f$chi))
+sd.fit.f   <- c(sd(fit.list.f$f.m),sd(fit.list.f$f.f),sd(fit.list.f$chi))
+
+print(round(mean.MLE.f,digits=3))
+print(round(sd.MLE.f,digits=3))
+print(round(mean.fit.f,digits=3))
+print(round(sd.fit.f,digits=3))
+```
+
+Calculate MLE statistics for simulated model (sexual selection only)
+
+```{r}
+
+n.e <- 1000
+# N <- 1000
+
+v.m <- 1
+v.f <- 1
+f.m <- 1
+f.f <- 1
+f.b <- 1
+alpha <- 0.6
+
+# for(i in (1:200)) {
+for(i in (1:5)) {
+
+  res <- evolve_overlapping(
+    initial_genotype_freq = initial_genotype_freq,
+    remate_chance = 0.05,
+    # effective_population_size = 0, 
+    effective_population_size = n.e, 
+    male_viability_fitness = v.m, 
+    female_viability_fitness = v.f, 
+    male_fecundity_fitness = f.m, 
+    female_fecundity_fitness = f.f, 
+    both_fecundity_fitness = f.b, 
+    male_mating_success = alpha, # assume same
+    max_week = 10,
+    eggs_per_female_that_reproduce = 25,
+    relative_competition_factor = 5,
+    low_density_growth_rate = 6
+  )
+  # N.sim <- N*x.sim
+
+  # estimate under fecundity only model
+  
+  p.lower <- c(500, 0.01)
+  p.upper <- c(2000, 1.0)
+  p.start <- c(1000,  0.5)
+  
+  p2.lower <- c(0.01)
+  p2.upper <- c(1.0)
+  p2.start <- c(0.5)
+
+  MLE.sim.m  <- optim(p.start,logL_only, method="L-BFGS-B",control=list(fnscale=-1), lower=p.lower, upper=p.upper, mode=2, population_statistic=res)
+  MLE.list.m <- rbind(MLE.list.m,data.frame(c=MLE.sim.m$par[1],alpha=MLE.sim.m$par[2],l=MLE.sim.m$value))
+  
+  fit.sim.m  <- optim(p.start,fit_only, method="L-BFGS-B",control=list(fnscale=1), lower=p2.lower, upper=p2.upper, mode=2, population_statistic=res)
+  fit.list.m <- rbind(fit.list.m,data.frame(alpha=fit.sim.m$par[1],chi=fit.sim.m$value))
+}
+
+mean.MLE.m <- c(mean(MLE.list.m$c),mean(MLE.list.m$alpha),mean(MLE.list.m$l))
+sd.MLE.m   <- c(sd(MLE.list.m$c),sd(MLE.list.m$alpha),sd(MLE.list.m$l))
+
+mean.fit.m <- c(mean(fit.list.m$alpha),mean(fit.list.m$chi))
+sd.fit.m   <- c(sd(fit.list.m$alpha),sd(fit.list.m$chi))
+
+print(round(mean.MLE.m,digits=3))
+print(round(sd.MLE.m,digits=3))
+print(round(mean.fit.m,digits=3))
+print(round(sd.fit.m,digits=3))
+```
+
+Plots
+
+```{r}
+col.1 <- "goldenrod2"  # yellow trajectories
+col.2 <- "gray40" # wild-type trajectories
+
+#col.1 <- "#2257A5" 
+#col.2 <- "#A4031F"
+#col.3 <- "#FFCE30"
+#col.4 <- "#091540"
+#col.5 <- "#FF3F3F"
+
+c1 <- 0.7
+
+```
+
+```{r}
+res1 <- evolve_overlapping(
+    initial_genotype_freq = initial_genotype_freq,
+    remate_chance = 0.05,
+    # effective_population_size = 0, 
+    effective_population_size = 0, 
+    male_viability_fitness = 0.6, 
+    female_viability_fitness = 0.8, 
+    male_fecundity_fitness = 1, 
+    female_fecundity_fitness = 1, 
+    both_fecundity_fitness = 1, 
+    male_mating_success = 1, # assume same
+    max_week = 10,
+    eggs_per_female_that_reproduce = 25,
+    relative_competition_factor = 5,
+    low_density_growth_rate = 6
+  )
+res2 <- evolve_overlapping(
+    initial_genotype_freq = initial_genotype_freq,
+    remate_chance = 0.05,
+    # effective_population_size = 0, 
+    effective_population_size = 0, 
+    male_viability_fitness = 1, 
+    female_viability_fitness = 1, 
+    male_fecundity_fitness = .6, 
+    female_fecundity_fitness = .8, 
+    both_fecundity_fitness = .48, 
+    male_mating_success = 1, # assume same
+    max_week = 10,
+    eggs_per_female_that_reproduce = 25,
+    relative_competition_factor = 5,
+    low_density_growth_rate = 6
+  )
+res3 <- evolve_overlapping(
+    initial_genotype_freq = initial_genotype_freq,
+    remate_chance = 0.05,
+    # effective_population_size = 0, 
+    effective_population_size = 0, 
+    male_viability_fitness = 1, 
+    female_viability_fitness = 1, 
+    male_fecundity_fitness = 1, 
+    female_fecundity_fitness = 1, 
+    both_fecundity_fitness = 1, 
+    male_mating_success = .6, # assume same
+    max_week = 10,
+    eggs_per_female_that_reproduce = 25,
+    relative_competition_factor = 5,
+    low_density_growth_rate = 6
+  )
+
+mat1 <- logL(c(300,0.6,0.8),res1,3)[[3]][4:11,]
+mat2 <- logL(c(300,0.6,0.8),res2,8)[[3]][4:11,]
+mat3 <- logL(c(300,0.6),res3,2)[[3]][4:11,]
+
+# 加载必要的包
+library(ggplot2)
+library(tidyr)
+
+# 转换为数据框并添加行号
+df1 <- as.data.frame(mat1)
+df2 <- as.data.frame(mat2)
+df3 <- as.data.frame(mat3)
+
+df1$x <- 3:10  # 添加 x 轴变量
+df2$x <- 3:10  # 添加 x 轴变量
+df3$x <- 3:10  # 添加 x 轴变量
+
+# 将数据转换为长格式
+df_long_1 <- pivot_longer(df1, cols = -x, names_to = "Genotype", values_to = "Value")
+df_long_2 <- pivot_longer(df2, cols = -x, names_to = "Genotype", values_to = "Value")
+df_long_3 <- pivot_longer(df3, cols = -x, names_to = "Genotype", values_to = "Value")
+
+# 绘制折线图
+p1 <- ggplot(df_long_1, aes(x = x, y = Value, color = Genotype, shape = Genotype)) +
+  geom_line() + geom_point() + scale_y_log10() + 
+  labs(x = "Weeks", y = "Genotype frequency") +
+  theme_minimal()
+
+p2 <- ggplot(df_long_2, aes(x = x, y = Value, color = Genotype, shape = Genotype)) +
+  geom_line() + geom_point() + scale_y_log10() + 
+  labs(x = "Weeks", y = "Genotype frequency") +
+  theme_minimal()
+
+p3 <- ggplot(df_long_3, aes(x = x, y = Value, color = Genotype, shape = Genotype)) +
+  geom_line() + geom_point() + scale_y_log10() + 
+  labs(x = "Weeks", y = "Genotype frequency") +
+  theme_minimal()
+
+ggsave("track_1.pdf", plot = p1, width = 5, height = 3)
+ggsave("track_2.pdf", plot = p2, width = 5, height = 3)
+ggsave("track_3.pdf", plot = p3, width = 5, height = 3)
+```
+
+26*26 tests for viability selection only
+
+```{r}
+# generate a grid of values
+# where the male viability fitness changes from 0.5 to 1 with 0.01 increment
+# so as female viability fitness
+# for each combination of values, run 10 simulations and calculate MLE statistic
+
+# generate a grid of values
+n.e <- 1000
+# male_viability_fitness_values <- seq(0.94, 1, by = 0.02)
+# female_viability_fitness_values <- seq(0.5, 1, by = 0.02)
+male_viability_fitness_values <- seq(0.94, 1, by = 0.1)
+female_viability_fitness_values <- seq(0.5, 1, by = 0.1)
+
+results <- data.frame()
+
+for (male_viability_fitness in male_viability_fitness_values) {
+  for (female_viability_fitness in female_viability_fitness_values) {
+    MLE_values <- numeric()
+    MLE_Ne <- numeric()
+    MLE_male_viability_fitness <- numeric()
+    MLE_female_viability_fitness <- numeric()
+    
+    fit_values <- numeric()
+    fit_male_viability_fitness <- numeric()
+    fit_female_viability_fitness <- numeric()
+    
+    accuracy <- 0
+    
+    # for (i in 1:10) {
+    for (i in 1:3) {
+      res <- evolve_overlapping(
+        initial_genotype_freq = initial_genotype_freq,
+        remate_chance = 0.05,
+        effective_population_size = n.e, 
+        male_viability_fitness = male_viability_fitness, 
+        female_viability_fitness = female_viability_fitness, 
+        male_fecundity_fitness = 1, 
+        female_fecundity_fitness = 1, 
+        both_fecundity_fitness = 1, 
+        male_mating_success = 1, # assume same
+        max_week = 10,
+        eggs_per_female_that_reproduce = 25,
+        relative_competition_factor = 5,
+        low_density_growth_rate = 6
+      )
+      
+      MLE_sim <- optim(c(1000, 0.5, 0.5), logL_only, method = "L-BFGS-B", control = list(fnscale = -1), 
+               lower = c(500, 0.01, 0.01), upper = c(2000, 1.0, 1.0), mode = 3, population_statistic = res)
+      
+      MLE_values <- c(MLE_values, MLE_sim$value)
+      MLE_Ne <- c(MLE_Ne, MLE_sim$par[1])
+      MLE_male_viability_fitness <- c(MLE_male_viability_fitness, MLE_sim$par[2])
+      MLE_female_viability_fitness <- c(MLE_female_viability_fitness, MLE_sim$par[3])
+      
+      fit_sim <- optim(c(0.5, 0.5), fit_only, method = "L-BFGS-B", control = list(fnscale = -1), 
+               lower = c(0.01, 0.01), upper = c(1.0, 1.0), mode = 3, population_statistic = res)
+      
+      fit_values <- c(fit_values, fit_sim$value)
+      fit_male_viability_fitness <- c(fit_male_viability_fitness, fit_sim$par[1])
+      fit_female_viability_fitness <- c(fit_female_viability_fitness, fit_sim$par[2])
+      
+      MLE_another <- optim(c(1000, 0.5, 0.5), logL_only, method = "L-BFGS-B", control = list(fnscale = -1), 
+               lower = c(500, 0.01, 0.01), upper = c(2000, 1.0, 1.0), mode = 8, population_statistic = res)
+      
+      if (MLE_sim$value > MLE_another$value) {
+        accuracy <- accuracy + 1
+      }
+    }
+  
+  mean_MLE <- mean(MLE_values)
+  mean_Ne <- mean(MLE_Ne)
+  mean_male_viability_fitness   <- mean(MLE_male_viability_fitness)
+  mean_female_viability_fitness <- mean(MLE_female_viability_fitness)
+  mean_fit <- mean(fit_values)
+  mean_fit_male_viability_fitness   <- mean(fit_male_viability_fitness)
+  mean_fit_female_viability_fitness <- mean(fit_female_viability_fitness)
+  # sd_MLE <- sd(MLE_values)
+  # sd_male_viability_fitness   <- sd(MLE_male_viability_fitness)
+  # sd_female_viability_fitness <- sd(MLE_female_viability_fitness)
+  
+  
+  results <- rbind(results, data.frame(
+                     male_viability_fitness = male_viability_fitness,
+                     female_viability_fitness = female_viability_fitness,
+                     mean_MLE_likelihood = mean_MLE,
+                     mean_MLE_Ne = mean_Ne,
+                     mean_MLE_male_viability_fitness = mean_male_viability_fitness,
+                     mean_MLE_female_viability_fitness = mean_female_viability_fitness,
+                     mean_fit_male_viability_fitness = mean_fit_male_viability_fitness,
+                     mean_fit_female_viability_fitness = mean_fit_female_viability_fitness,
+                     accuracy <- accuracy / 10
+                    ))
+  }
+}
+
+print(results)
+write.csv(results, "results_viability_2.csv")
+
+results_viability <- results
+```
+
+26*26 tests for fecundity selection only (not stable)
+
+```{r}
+# generate a grid of values
+# where the male fecundity fitness changes from 0.5 to 1 with 0.01 increment
+# so as female fecundity fitness
+# for each combination of values, run 10 simulations and calculate MLE statistic
+
+# generate a grid of values
+n.e <- 1000
+# male_fecundity_fitness_values <- seq(0.5, 1, by = 0.02)
+# female_fecundity_fitness_values <- seq(0.5, 1, by = 0.02)
+male_fecundity_fitness_values <- seq(0.5, 1, by = 0.2)
+female_fecundity_fitness_values <- seq(0.5, 1, by = 0.2)
+
+results <- data.frame()
+
+for (male_fecundity_fitness in male_fecundity_fitness_values) {
+  for (female_fecundity_fitness in female_fecundity_fitness_values) {
+    MLE_values <- numeric()
+    MLE_Ne <- numeric()
+    MLE_male_fecundity_fitness <- numeric()
+    MLE_female_fecundity_fitness <- numeric()
+    
+    fit_values <- numeric()
+    fit_male_fecundity_fitness <- numeric()
+    fit_female_fecundity_fitness <- numeric()
+    
+    accuracy <- 0
+    
+    # for (i in 1:10) {
+    for (i in 1:3) {
+      res <- evolve_overlapping(
+        initial_genotype_freq = initial_genotype_freq,
+        remate_chance = 0.05,
+        effective_population_size = n.e, 
+        male_viability_fitness = 1, 
+        female_viability_fitness = 1, 
+        male_fecundity_fitness = male_fecundity_fitness, 
+        female_fecundity_fitness = female_fecundity_fitness, 
+        both_fecundity_fitness = male_fecundity_fitness * female_fecundity_fitness, 
+        male_mating_success = 1, # assume same
+        max_week = 10,
+        eggs_per_female_that_reproduce = 25,
+        relative_competition_factor = 5,
+        low_density_growth_rate = 6
+      )
+      
+      MLE_sim <- optim(c(1000, 0.5, 0.5), logL_only, method = "L-BFGS-B", control = list(fnscale = -1), 
+               lower = c(500, 0.01, 0.01), upper = c(2000, 1.0, 1.0), mode = 8, population_statistic = res)
+      
+      MLE_values <- c(MLE_values, MLE_sim$value)
+      MLE_Ne <- c(MLE_Ne, MLE_sim$par[1])
+      MLE_male_fecundity_fitness <- c(MLE_male_fecundity_fitness, MLE_sim$par[2])
+      MLE_female_fecundity_fitness <- c(MLE_female_fecundity_fitness, MLE_sim$par[3])
+      
+      fit_sim <- optim(c(0.5, 0.5), fit_only, method = "L-BFGS-B", control = list(fnscale = -1), 
+               lower = c(0.01, 0.01), upper = c(1.0, 1.0), mode = 8, population_statistic = res)
+      
+      fit_values <- c(fit_values, fit_sim$value)
+      fit_male_fecundity_fitness <- c(fit_male_fecundity_fitness, fit_sim$par[1])
+      fit_female_fecundity_fitness <- c(fit_female_fecundity_fitness, fit_sim$par[2])
+      
+      MLE_another <- optim(c(1000, 0.5, 0.5), logL_only, method = "L-BFGS-B", control = list(fnscale = -1), 
+               lower = c(500, 0.01, 0.01), upper = c(2000, 1.0, 1.0), mode = 3, population_statistic = res)
+      
+      if (MLE_sim$value > MLE_another$value) {
+        accuracy <- accuracy + 1
+      }
+    }
+  
+  mean_MLE <- mean(MLE_values)
+  mean_Ne <- mean(MLE_Ne)
+  mean_male_fecundity_fitness   <- mean(MLE_male_fecundity_fitness)
+  mean_female_fecundity_fitness <- mean(MLE_female_fecundity_fitness)
+  mean_fit <- mean(fit_values)
+  mean_fit_male_fecundity_fitness   <- mean(fit_male_fecundity_fitness)
+  mean_fit_female_fecundity_fitness <- mean(fit_female_fecundity_fitness)
+  # sd_MLE <- sd(MLE_values)
+  # sd_male_viability_fitness   <- sd(MLE_male_viability_fitness)
+  # sd_female_viability_fitness <- sd(MLE_female_viability_fitness)
+  
+  
+  results <- rbind(results, data.frame(
+                     male_fecundity_fitness = male_fecundity_fitness,
+                     female_fecundity_fitness = female_fecundity_fitness,
+                     mean_MLE_likelihood = mean_MLE,
+                     mean_MLE_Ne = mean_Ne,
+                     mean_MLE_male_fecundity_fitness = mean_male_fecundity_fitness,
+                     mean_MLE_female_fecundity_fitness = mean_female_fecundity_fitness,
+                     mean_fit_male_fecundity_fitness = mean_fit_male_fecundity_fitness,
+                     mean_fit_female_fecundity_fitness = mean_fit_female_fecundity_fitness,
+                     accuracy <- accuracy / 10
+                    ))
+  }
+}
+
+print(results)
+
+results_fecundity <- results
+results_fecundity_bk <- results_fecundity
+results_fecundity_bk_bk <- results_fecundity_bk
+
+print(results_fecundity)
+write.csv(results_fecundity, "results_fecundity.csv")
+```
+
+```{r}
+# generate a grid of values
+# where the male fecundity fitness changes from 0.5 to 1 with 0.01 increment
+# so as female fecundity fitness
+# for each combination of values, run 10 simulations and calculate MLE statistic
+
+# generate a grid of values
+n.e <- 1000
+male_fecundity_fitness_values <- seq(0.94, 1, by = 0.02)
+female_fecundity_fitness_values <- seq(0.5, 1, by = 0.02)
+
+results_2 <- data.frame()
+
+for (male_fecundity_fitness in male_fecundity_fitness_values) {
+  for (female_fecundity_fitness in female_fecundity_fitness_values) {
+    MLE_values <- numeric()
+    MLE_Ne <- numeric()
+    MLE_male_fecundity_fitness <- numeric()
+    MLE_female_fecundity_fitness <- numeric()
+    
+    fit_values <- numeric()
+    fit_male_fecundity_fitness <- numeric()
+    fit_female_fecundity_fitness <- numeric()
+    
+    accuracy <- 0
+    
+    for (i in 1:10) {
+      res <- evolve_overlapping(
+        initial_genotype_freq = initial_genotype_freq,
+        remate_chance = 0.05,
+        effective_population_size = n.e, 
+        male_viability_fitness = 1, 
+        female_viability_fitness = 1, 
+        male_fecundity_fitness = male_fecundity_fitness, 
+        female_fecundity_fitness = female_fecundity_fitness, 
+        both_fecundity_fitness = male_fecundity_fitness * female_fecundity_fitness, 
+        male_mating_success = 1, # assume same
+        max_week = 10,
+        eggs_per_female_that_reproduce = 25,
+        relative_competition_factor = 5,
+        low_density_growth_rate = 6
+      )
+      
+      MLE_sim <- optim(c(1000, 0.5, 0.5), logL_only, method = "L-BFGS-B", control = list(fnscale = -1), 
+               lower = c(500, 0.01, 0.01), upper = c(2000, 1.0, 1.0), mode = 8, population_statistic = res)
+      
+      MLE_values <- c(MLE_values, MLE_sim$value)
+      MLE_Ne <- c(MLE_Ne, MLE_sim$par[1])
+      MLE_male_fecundity_fitness <- c(MLE_male_fecundity_fitness, MLE_sim$par[2])
+      MLE_female_fecundity_fitness <- c(MLE_female_fecundity_fitness, MLE_sim$par[3])
+      
+      fit_sim <- optim(c(0.5, 0.5), fit_only, method = "L-BFGS-B", control = list(fnscale = -1), 
+               lower = c(0.01, 0.01), upper = c(1.0, 1.0), mode = 8, population_statistic = res)
+      
+      fit_values <- c(fit_values, fit_sim$value)
+      fit_male_fecundity_fitness <- c(fit_male_fecundity_fitness, fit_sim$par[1])
+      fit_female_fecundity_fitness <- c(fit_female_fecundity_fitness, fit_sim$par[2])
+      
+      MLE_another <- optim(c(1000, 0.5, 0.5), logL_only, method = "L-BFGS-B", control = list(fnscale = -1), 
+               lower = c(500, 0.01, 0.01), upper = c(2000, 1.0, 1.0), mode = 3, population_statistic = res)
+      
+      if (MLE_sim$value > MLE_another$value) {
+        accuracy <- accuracy + 1
+      }
+    }
+  
+  mean_MLE <- mean(MLE_values)
+  mean_Ne <- mean(MLE_Ne)
+  mean_male_fecundity_fitness   <- mean(MLE_male_fecundity_fitness)
+  mean_female_fecundity_fitness <- mean(MLE_female_fecundity_fitness)
+  mean_fit <- mean(fit_values)
+  mean_fit_male_fecundity_fitness   <- mean(fit_male_fecundity_fitness)
+  mean_fit_female_fecundity_fitness <- mean(fit_female_fecundity_fitness)
+  # sd_MLE <- sd(MLE_values)
+  # sd_male_viability_fitness   <- sd(MLE_male_viability_fitness)
+  # sd_female_viability_fitness <- sd(MLE_female_viability_fitness)
+  
+  
+  results_2 <- rbind(results_2, data.frame(
+                     male_fecundity_fitness = male_fecundity_fitness,
+                     female_fecundity_fitness = female_fecundity_fitness,
+                     mean_MLE_likelihood = mean_MLE,
+                     mean_MLE_Ne = mean_Ne,
+                     mean_MLE_male_fecundity_fitness = mean_male_fecundity_fitness,
+                     mean_MLE_female_fecundity_fitness = mean_female_fecundity_fitness,
+                     mean_fit_male_fecundity_fitness = mean_fit_male_fecundity_fitness,
+                     mean_fit_female_fecundity_fitness = mean_fit_female_fecundity_fitness,
+                     accuracy <- accuracy / 10
+                    ))
+  }
+}
+
+print(results_2)
+
+results_fecundity <- rbind(results_fecundity, results_2)
+
+#results_fecundity <- results
+
+print(results_fecundity)
+```
+
+比较推断结果和真实值，计算欧氏距离
+```{r}
+results_viability <- read.csv("results_viability.csv")
+results_fecundity <- read.csv("results_fecundity.csv")
+
+# compare the inferred values with the true values
+# calculate the Euclidean distance
+results_viability$distance <- sqrt((results_viability$male_viability_fitness   - results_viability$mean_MLE_male_viability_fitness)^2 +
+                                   (results_viability$female_viability_fitness - results_viability$mean_MLE_female_viability_fitness)^2)
+results_fecundity$distance <- sqrt((results_fecundity$male_fecundity_fitness   - results_fecundity$mean_MLE_male_fecundity_fitness)^2 +
+                                   (results_fecundity$female_fecundity_fitness - results_fecundity$mean_MLE_female_fecundity_fitness)^2)
+
+# compare the inferred values with the true values
+# calculate the Euclidean distance
+results_viability$distance_fit <- sqrt((results_viability$male_viability_fitness   - results_viability$mean_fit_male_viability_fitness)^2 +
+                                     (results_viability$female_viability_fitness   - results_viability$mean_fit_female_viability_fitness)^2)
+results_fecundity$distance_fit <- sqrt((results_fecundity$male_fecundity_fitness   - results_fecundity$mean_fit_male_fecundity_fitness)^2 +
+                                     (results_fecundity$female_fecundity_fitness   - results_fecundity$mean_fit_female_fecundity_fitness)^2)
+```
+
+对上述欧氏距离做热图
+```{r}
+library(ggplot2)
+
+# Viability selection heatmap
+p1 <- ggplot(results_viability, aes(x = male_viability_fitness, y = female_viability_fitness, fill = distance)) +
+  geom_tile() +
+  scale_fill_gradient(low = "green", high = "white") +
+  labs(title = "",
+       x = "Male Viability Fitness",
+       y = "Female Viability Fitness",
+       fill = "Distance") +
+  theme_minimal() + coord_fixed()
+
+# Fecundity selection heatmap
+p2 <- ggplot(results_fecundity, aes(x = male_fecundity_fitness, y = female_fecundity_fitness, fill = distance)) +
+  geom_tile() +
+  scale_fill_gradient(low = "green", high = "white") +
+  labs(title = "",
+       x = "Male Fecundity Fitness",
+       y = "Female Fecundity Fitness",
+       fill = "Distance") +
+  theme_minimal() + coord_fixed()
+
+# Save plots to PDF
+ggsave("viability_heatmap.pdf", plot = p1, width = 3, height = 3)
+ggsave("fecundity_heatmap.pdf", plot = p2, width = 3, height = 3)
+
+# Viability selection heatmap
+p1 <- ggplot(results_viability, aes(x = male_viability_fitness, y = female_viability_fitness, fill = distance_fit)) +
+  geom_tile() +
+  scale_fill_gradient(low = "red", high = "white") +
+  labs(title = "",
+       x = "Male Viability Fitness",
+       y = "Female Viability Fitness",
+       fill = "Distance") +
+  theme_minimal() + coord_fixed()
+
+# Fecundity selection heatmap
+p2 <- ggplot(results_fecundity, aes(x = male_fecundity_fitness, y = female_fecundity_fitness, fill = distance_fit)) +
+  geom_tile() +
+  scale_fill_gradient(low = "red", high = "white") +
+  labs(title = "",
+       x = "Male Fecundity Fitness",
+       y = "Female Fecundity Fitness",
+       fill = "Distance") +
+  theme_minimal() + coord_fixed()
+
+# Save plots to PDF
+ggsave("viability_heatmap_fit.pdf", plot = p1, width = 3, height = 3)
+ggsave("fecundity_heatmap_fit.pdf", plot = p2, width = 3, height = 3)
+
+# Viability selection heatmap
+p5 <- ggplot(results_viability, aes(x = male_viability_fitness, y = female_viability_fitness, fill = mean_MLE_Ne)) +
+  geom_tile() +
+  scale_fill_gradient(low = "yellow", high = "blue") +
+  labs(title = "",
+       x = "Male Viability Fitness",
+       y = "Female Viability Fitness",
+       fill = "N_e") +
+  theme_minimal() + coord_fixed()
+
+# Fecundity selection heatmap
+p6 <- ggplot(results_fecundity, aes(x = male_fecundity_fitness, y = female_fecundity_fitness, fill = mean_MLE_Ne)) +
+  geom_tile() +
+  scale_fill_gradient(low = "yellow", high = "blue") +
+  labs(title = "",
+       x = "Male Fecundity Fitness",
+       y = "Female Fecundity Fitness",
+       fill = "N_e") +
+  theme_minimal() + coord_fixed()
+
+# Save plots to PDF
+ggsave("Ne_v.pdf", plot = p5, width = 3, height = 3)
+ggsave("Ne_f.pdf", plot = p6, width = 3, height = 3)
+
+# Viability selection heatmap
+p7 <- ggplot(results_viability, aes(x = male_viability_fitness, y = female_viability_fitness, fill = accuracy....accuracy.10)) +
+  geom_tile() +
+  scale_fill_gradient() +
+  labs(title = "",
+       x = "Male Viability Fitness",
+       y = "Female Viability Fitness",
+       fill = "Sorting accuracy") +
+  theme_minimal() + coord_fixed()
+
+# Fecundity selection heatmap
+p8 <- ggplot(results_fecundity, aes(x = male_fecundity_fitness, y = female_fecundity_fitness, fill = accuracy....accuracy.10)) +
+  geom_tile() +
+  scale_fill_gradient() +
+  labs(title = "",
+       x = "Male Fecundity Fitness",
+       y = "Female Fecundity Fitness",
+       fill = "Sorting accuracy") +
+  theme_minimal() + coord_fixed()
+
+# Save plots to PDF
+ggsave("acc_v.pdf", plot = p7, width = 4.5, height = 4)
+ggsave("acc_f.pdf", plot = p8, width = 4.5, height = 4)
+
+print(results_viability)
+```
+
+
+
