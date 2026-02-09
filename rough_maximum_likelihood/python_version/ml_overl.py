@@ -342,7 +342,8 @@ def log_likelihood(
     both_fecundity_fitness = 1.0
     male_mating_success = 1.0
     remate_chance = 0.05
-    drive_efficiency = 0.5  # Default: standard Mendelian
+    # Note: drive_efficiency is NOT used in logL function
+    # R's logL always uses standard Mendelian inheritance (/2, /4)
     
     # Parse parameters based on mode
     if mode == 1:  # Full model
@@ -398,8 +399,10 @@ def log_likelihood(
     observed_new_adult = np.zeros((n_weeks, 6))
     
     # Initialize first row
+    # Note: R uses rowSums(population_statistic[[1]][1:3, 3:8]) for females (all adult ages 2-7)
+    #       and rowSums(population_statistic[[1]][4:6, 3:8]) for males (all adult ages 2-7)
     female_adults = np.sum(pop_stat[0][0:3, 2:8], axis=1)
-    male_adults = np.sum(pop_stat[0][3:6, 2:5], axis=1)
+    male_adults = np.sum(pop_stat[0][3:6, 2:8], axis=1) 
     
     female_sum = np.sum(female_adults)
     male_sum = np.sum(male_adults)
@@ -509,33 +512,31 @@ def log_likelihood(
         stored_dw = population[STORED_DW, 2:8]
         stored_ww = population[STORED_WW, 2:8]
         
-        # Drive conversion parameters
-        e = drive_efficiency
-        h_to_w = 1 - e
-        
-        # Calculate newborn genotypes (WITH DRIVE CONVERSION)
+        # Calculate newborn genotypes using STANDARD MENDELIAN INHERITANCE
+        # Note: R's logL function always uses /2 and /4, NOT drive conversion!
+        # This is different from evolve_overlapping which uses drive_efficiency.
         newborn_dd = (
-            both_fecundity_fitness * np.sum(fem_dd * stored_dd) +       # dd × dd → 100% dd
-            female_fecundity_fitness * np.sum(fem_dd * stored_dw) * e + # dd × dw → e dd
-            male_fecundity_fitness * np.sum(fem_dw * stored_dd) * e +   # dw × dd → e dd
-            np.sum(fem_dw * stored_dw) * e * e                          # dw × dw → e² dd
+            both_fecundity_fitness * np.sum(fem_dd * stored_dd) +           # dd × dd → 100% dd
+            female_fecundity_fitness * np.sum(fem_dd * stored_dw) / 2 +    # dd × dw → 1/2 dd
+            male_fecundity_fitness * np.sum(fem_dw * stored_dd) / 2 +      # dw × dd → 1/2 dd
+            np.sum(fem_dw * stored_dw) / 4                                  # dw × dw → 1/4 dd
         )
         
         newborn_dw = (
-            female_fecundity_fitness * np.sum(fem_dd * stored_dw) * h_to_w +  # dd × dw → (1-e) dw
-            female_fecundity_fitness * np.sum(fem_dd * stored_ww) +           # dd × ww → 100% dw
-            male_fecundity_fitness * np.sum(fem_dw * stored_dd) * h_to_w +    # dw × dd → (1-e) dw
-            np.sum(fem_dw * stored_dw) * 2 * e * h_to_w +                     # dw × dw → 2e(1-e) dw
-            np.sum(fem_dw * stored_ww) * e +                                  # dw × ww → e dw
-            male_fecundity_fitness * np.sum(fem_ww * stored_dd) +             # ww × dd → 100% dw
-            np.sum(fem_ww * stored_dw) * e                                    # ww × dw → e dw
+            female_fecundity_fitness * np.sum(fem_dd * stored_dw) / 2 +    # dd × dw → 1/2 dw
+            female_fecundity_fitness * np.sum(fem_dd * stored_ww) +        # dd × ww → 100% dw
+            male_fecundity_fitness * np.sum(fem_dw * stored_dd) / 2 +      # dw × dd → 1/2 dw
+            np.sum(fem_dw * stored_dw) / 2 +                                # dw × dw → 1/2 dw
+            np.sum(fem_dw * stored_ww) / 2 +                                # dw × ww → 1/2 dw
+            male_fecundity_fitness * np.sum(fem_ww * stored_dd) +          # ww × dd → 100% dw
+            np.sum(fem_ww * stored_dw) / 2                                  # ww × dw → 1/2 dw
         )
         
         newborn_ww = (
-            np.sum(fem_ww * stored_ww) +                      # ww × ww → 100% ww
-            np.sum(fem_ww * stored_dw) * h_to_w +             # ww × dw → (1-e) ww
-            np.sum(fem_dw * stored_ww) * h_to_w +             # dw × ww → (1-e) ww
-            np.sum(fem_dw * stored_dw) * h_to_w * h_to_w     # dw × dw → (1-e)² ww
+            np.sum(fem_ww * stored_ww) +                       # ww × ww → 100% ww
+            np.sum(fem_ww * stored_dw) / 2 +                   # ww × dw → 1/2 ww
+            np.sum(fem_dw * stored_ww) / 2 +                   # dw × ww → 1/2 ww
+            np.sum(fem_dw * stored_dw) / 4                     # dw × dw → 1/4 ww
         )
         
         # Sex differentiation
@@ -631,22 +632,25 @@ def estimate_mle(
         Optimization results including estimated parameters and log-likelihood
     """
     # Default bounds and initial values by mode
+    # Note: Initial Ne=2000 (upper bound) to match R optim behavior
+    # In deterministic mode (Ne=0 simulation), likelihood increases with Ne, 
+    # so starting at upper bound ensures optimizer finds global maximum
     default_configs = {
-        1: {'start': [1000, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        1: {'start': [2000, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
             'bounds': [(500, 2000), (0.01, 1), (0.01, 1), (0.01, 1), (0.01, 1), (0.01, 1), (0.01, 1)]},
-        2: {'start': [1000, 0.5],
+        2: {'start': [2000, 0.5],
             'bounds': [(500, 2000), (0.01, 1)]},
-        3: {'start': [1000, 0.5, 0.5],
+        3: {'start': [2000, 0.5, 0.5],
             'bounds': [(500, 2000), (0.01, 1), (0.01, 1)]},
-        4: {'start': [1000, 0.5, 0.5, 0.25],
+        4: {'start': [2000, 0.5, 0.5, 0.25],
             'bounds': [(500, 2000), (0.01, 1), (0.01, 1), (0.01, 1)]},
-        5: {'start': [1000, 0.5, 0.5],
+        5: {'start': [2000, 0.5, 0.5],
             'bounds': [(500, 2000), (0.01, 1), (0.01, 1)]},
-        6: {'start': [1000, 0.5, 0.5],
+        6: {'start': [2000, 0.5, 0.5],
             'bounds': [(500, 2000), (0.01, 1), (0.01, 1)]},
-        7: {'start': [1000, 0.5],
+        7: {'start': [2000, 0.5],
             'bounds': [(500, 2000), (0.01, 1)]},
-        8: {'start': [1000, 0.5, 0.5],
+        8: {'start': [2000, 0.5, 0.5],
             'bounds': [(500, 2000), (0.01, 1), (0.01, 1)]},
     }
     
@@ -1111,71 +1115,41 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Mosquito fitness MLE estimation')
-    parser.add_argument('--batch', action='store_true', help='Run batch MLE tests with heatmaps')
-    parser.add_argument('--output-dir', type=str, default='.', help='Output directory for PDFs')
+    parser.add_argument('--skip-heatmaps', action='store_true', help='Skip batch MLE tests (heatmaps)')
+    parser.add_argument('--output-dir', type=str, default=None, help='Output directory for PDFs')
     args = parser.parse_args()
     
-    # Output directory
-    output_dir = args.output_dir
+    # Output directory: default to output_plots folder relative to this script
+    if args.output_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        output_dir = os.path.join(script_dir, "output_plots")
+    else:
+        output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
     
-    # Initial genotype frequency matrix
+    # Initial genotype frequency matrix (matching R code line 721)
+    # Note: R uses c(0, 0, 0.085714286, ...) - dd at age 2 (column 3 in R, column 2 in Python)
     initial_genotype_freq = np.array([
-        [0, 0.085714286, 0, 0, 0, 0, 0, 0],                                    # female_dd
+        [0, 0, 0.085714286, 0, 0, 0, 0, 0],                                    # female_dd
         [0, 0, 0, 0, 0, 0, 0, 0],                                              # female_dw
-        [0, 0.2, 0.285714286, 0.238095238, 0.19047619, 0.142857143, 0.095238095, 0.047619048],  # female_ww
-        [0, 0.085714286, 0, 0, 0, 0, 0, 0],                                    # male_dd
+        [0, 0.285714286, 0.2, 0.238095238, 0.19047619, 0.142857143, 0.095238095, 0.047619048],  # female_ww
+        [0, 0, 0.085714286, 0, 0, 0, 0, 0],                                    # male_dd
         [0, 0, 0, 0, 0, 0, 0, 0],                                              # male_dw
-        [0, 0.2, 0.285714286, 0.19047619, 0.095238095, 0, 0, 0],               # male_ww
+        [0, 0.285714286, 0.2, 0.19047619, 0.095238095, 0, 0, 0],               # male_ww
     ])
     
-    np.random.seed(42)
+    np.random.seed(826)
     
-    # =========================================================================
-    # 1. Drive comparison simulation and plot
-    # =========================================================================
-    print("=" * 60)
-    print("1. Gene Drive Comparison")
+    print(f"Output directory: {output_dir}")
     print("=" * 60)
     
-    params_no_drive = SimulationParams(
-        effective_population_size=300,
-        male_viability_fitness=0.8,
-        female_viability_fitness=0.8,
-        max_week=32,
-        drive_efficiency=0.5  # Standard Mendelian
-    )
-    
-    params_with_drive = SimulationParams(
-        effective_population_size=300,
-        male_viability_fitness=0.8,
-        female_viability_fitness=0.8,
-        max_week=32,
-        drive_efficiency=0.7  # Gene drive
-    )
-    
-    result_no_drive = evolve_overlapping(initial_genotype_freq, params_no_drive)
-    result_with_drive = evolve_overlapping(initial_genotype_freq, params_with_drive)
-    
-    # Plot drive comparison (like R's plot in chunk 7)
-    plot_drive_comparison(
-        result_no_drive, result_with_drive,
-        os.path.join(output_dir, "drive_comparison.pdf")
-    )
-    
-    # Print brief summary (like R output)
-    freq_no_drive = get_d_allele_freq(result_no_drive)
-    freq_with_drive = get_d_allele_freq(result_with_drive)
-    print(f"Week 30: No drive={freq_no_drive[30]:.3f}, With drive={freq_with_drive[30]:.3f}")
-    
     # =========================================================================
-    # 2. Genotype trajectory plots (track_1, track_2, track_3)
+    # 1. Genotype trajectory plots (track_1, track_2, track_3)
     # =========================================================================
-    print("\n" + "=" * 60)
-    print("2. Genotype Trajectory Plots")
+    print("1. Genotype Trajectory Plots")
     print("=" * 60)
     
-    # Viability selection only (track_1)
+    # Viability selection only (track_1) - matches R: v.m=0.6, v.f=0.8
     params1 = SimulationParams(
         effective_population_size=0,  # Deterministic
         male_viability_fitness=0.6,
@@ -1188,7 +1162,7 @@ if __name__ == "__main__":
                             output_path=os.path.join(output_dir, "track_1.pdf"),
                             title="Viability Selection")
     
-    # Fecundity selection only (track_2)
+    # Fecundity selection only (track_2) - matches R: f.m=0.6, f.f=0.8, f.b=0.48
     params2 = SimulationParams(
         effective_population_size=0,
         male_fecundity_fitness=0.6,
@@ -1202,7 +1176,7 @@ if __name__ == "__main__":
                             output_path=os.path.join(output_dir, "track_2.pdf"),
                             title="Fecundity Selection")
     
-    # Sexual selection only (track_3)
+    # Sexual selection only (track_3) - matches R: alpha=0.6
     params3 = SimulationParams(
         effective_population_size=0,
         male_mating_success=0.6,
@@ -1215,46 +1189,45 @@ if __name__ == "__main__":
                             title="Sexual Selection")
     
     # =========================================================================
-    # 3. MLE estimation test
+    # 2. Batch MLE tests with heatmaps (matching R parameters)
     # =========================================================================
-    print("\n" + "=" * 60)
-    print("3. MLE Estimation Test")
-    print("=" * 60)
-    
-    mle_result = estimate_mle(result_no_drive, mode=3)
-    print(f"Estimated: Ne={mle_result['params'][0]:.0f}, v.m={mle_result['params'][1]:.3f}, v.f={mle_result['params'][2]:.3f}")
-    print(f"True:      Ne=300, v.m=0.800, v.f=0.800")
-    print(f"LogL: {mle_result['log_likelihood']:.2f}")
-    
-    # =========================================================================
-    # 4. Batch MLE tests with heatmaps (optional, slow)
-    # =========================================================================
-    if args.batch:
+    if not args.skip_heatmaps:
         print("\n" + "=" * 60)
-        print("4. Batch MLE Tests (generating heatmaps)")
+        print("2. Batch MLE Tests (generating heatmaps)")
         print("=" * 60)
         
-        # Use smaller grid for faster demo
-        fitness_values = np.arange(0.5, 1.01, 0.1)
+        # Matching R parameters:
+        # viability: fitness from 0.5 to 1.0, step 0.1
+        # fecundity: fitness from 0.5 to 1.0, step 0.2
+        # n_simulations = 3, n_e = 1000, max_week = 10
+        
+        viability_fitness_values = np.arange(0.5, 1.01, 0.1)  # [0.5, 0.6, ..., 1.0]
+        fecundity_fitness_values = np.arange(0.5, 1.01, 0.2)  # [0.5, 0.7, 0.9] (matching R's by=0.2)
         
         print("\nViability selection tests...")
+        print(f"  Grid: {len(viability_fitness_values)}x{len(viability_fitness_values)} = {len(viability_fitness_values)**2} combinations")
         df_viability = run_batch_mle_test(
-            initial_genotype_freq, fitness_values,
+            initial_genotype_freq, viability_fitness_values,
             selection_type="viability",
-            n_simulations=3,
+            n_simulations=3,  # Match R: for (i in 1:3)
+            n_e=0,            # Deterministic mode (Ne=0)
+            max_week=10,      # Match R: max_week = 10
             output_dir=output_dir
         )
-        print(f"Mean distance: {df_viability['distance'].mean():.3f}")
+        print(f"  Mean distance: {df_viability['distance'].mean():.3f}")
         
         print("\nFecundity selection tests...")
+        print(f"  Grid: {len(fecundity_fitness_values)}x{len(fecundity_fitness_values)} = {len(fecundity_fitness_values)**2} combinations")
         df_fecundity = run_batch_mle_test(
-            initial_genotype_freq, fitness_values,
+            initial_genotype_freq, fecundity_fitness_values,
             selection_type="fecundity",
-            n_simulations=3,
+            n_simulations=3,  # Match R: for (i in 1:3)
+            n_e=0,            # Deterministic mode (Ne=0)
+            max_week=10,      # Match R: max_week = 10
             output_dir=output_dir
         )
-        print(f"Mean distance: {df_fecundity['distance'].mean():.3f}")
+        print(f"  Mean distance: {df_fecundity['distance'].mean():.3f}")
     
     print("\n" + "=" * 60)
-    print("Done! Check output directory for PDF files.")
+    print("Done! Generated PDFs in:", output_dir)
     print("=" * 60)

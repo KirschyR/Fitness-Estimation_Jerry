@@ -1477,6 +1477,3 @@ ggsave("acc_f.pdf", plot = p8, width = 4.5, height = 4)
 
 print(results_viability)
 ```
-
-
-
