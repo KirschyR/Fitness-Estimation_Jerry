@@ -679,6 +679,111 @@ def estimate_mle(
         'n_iterations': result.nit
     }
 
+# 多起始点优化
+def estimate_mle_multistart(
+    population_statistic: List[np.ndarray],
+    mode: int,
+    n_starts: int = 5,
+    bounds: Optional[List[Tuple[float, float]]] = None
+) -> Dict:
+    """
+    Estimate maximum likelihood parameters using multi-start optimization.
+    
+    This helps avoid local optima, especially for fecundity models where
+    the likelihood surface can be relatively flat.
+    
+    Parameters
+    ----------
+    population_statistic : List[np.ndarray]
+        Observed population data
+    mode : int
+        Model type (1-8)
+    n_starts : int
+        Number of random starting points (default: 5)
+    bounds : list of tuples, optional
+        Parameter bounds
+        
+    Returns
+    -------
+    dict
+        Best optimization results including estimated parameters and log-likelihood
+    """
+    # Default bounds by mode
+    default_bounds = {
+        1: [(500, 2000), (0.01, 1), (0.01, 1), (0.01, 1), (0.01, 1), (0.01, 1), (0.01, 1)],
+        2: [(500, 2000), (0.01, 1)],
+        3: [(500, 2000), (0.01, 1), (0.01, 1)],
+        4: [(500, 2000), (0.01, 1), (0.01, 1), (0.01, 1)],
+        5: [(500, 2000), (0.01, 1), (0.01, 1)],
+        6: [(500, 2000), (0.01, 1), (0.01, 1)],
+        7: [(500, 2000), (0.01, 1)],
+        8: [(500, 2000), (0.01, 1), (0.01, 1)],
+    }
+    
+    if bounds is None:
+        bounds = default_bounds.get(mode, default_bounds[1])
+    
+    n_params = len(bounds)
+    
+    # Generate starting points: include corners and random points
+    starting_points = []
+    
+    # Always start with Ne=2000 (upper bound) and (0.5, 0.5) for fitness params
+    default_start = [2000] + [0.5] * (n_params - 1)
+    starting_points.append(default_start)
+    
+    # Add asymmetric starting points to break symmetry in fecundity models
+    if n_params >= 3:  # Has male and female fitness params
+        # Start with male < female
+        starting_points.append([2000, 0.3, 0.7] + [0.5] * (n_params - 3))
+        # Start with male > female
+        starting_points.append([2000, 0.7, 0.3] + [0.5] * (n_params - 3))
+        # Low values
+        starting_points.append([2000, 0.2, 0.2] + [0.5] * (n_params - 3))
+        # High values
+        starting_points.append([2000, 0.8, 0.8] + [0.5] * (n_params - 3))
+    
+    # Add more random starting points if needed
+    while len(starting_points) < n_starts:
+        start = [2000]  # Ne always at upper bound
+        for low, high in bounds[1:]:
+            start.append(np.random.uniform(low, high))
+        starting_points.append(start)
+    
+    # Run optimization from each starting point
+    best_result = None
+    best_logL = -np.inf
+    
+    for start in starting_points[:n_starts]:
+        try:
+            result = minimize(
+                neg_log_likelihood,
+                np.array(start),
+                args=(population_statistic, mode),
+                method='L-BFGS-B',
+                bounds=bounds,
+                options={'maxiter': 1000, 'ftol': 1e-8}
+            )
+            
+            logL = -result.fun
+            if logL > best_logL:
+                best_logL = logL
+                best_result = result
+        except Exception:
+            continue
+    
+    if best_result is None:
+        # Fallback to single-start version
+        return estimate_mle(population_statistic, mode, bounds=bounds)
+    
+    return {
+        'params': best_result.x,
+        'log_likelihood': -best_result.fun,
+        'success': best_result.success,
+        'message': best_result.message,
+        'n_iterations': best_result.nit
+    }
+
 
 # =============================================================================
 # Parallel simulation utilities (for batch runs)
@@ -996,6 +1101,7 @@ def run_batch_mle_test(
             fit_values = []
             fit_male_fitness = []
             fit_female_fitness = []
+            accuracy_count = 0  # Model selection accuracy counter
             
             for _ in range(n_simulations):
                 if selection_type == "viability":
@@ -1016,8 +1122,8 @@ def run_batch_mle_test(
                 
                 res = evolve_overlapping(initial_genotype_freq, params)
                 
-                # MLE estimation
-                mle_result = estimate_mle(res, mode=mode)
+                # MLE estimation (using multi-start optimization for better accuracy)
+                mle_result = estimate_mle_multistart(res, mode=mode, n_starts=5)
                 MLE_values.append(mle_result['log_likelihood'])
                 MLE_Ne.append(mle_result['params'][0])
                 MLE_male_fitness.append(mle_result['params'][1])
@@ -1039,6 +1145,13 @@ def run_batch_mle_test(
                     fit_values.append(np.nan)
                     fit_male_fitness.append(np.nan)
                     fit_female_fitness.append(np.nan)
+                
+                # Model selection accuracy: compare with alternative model
+                # viability (mode=3) vs fecundity (mode=8)
+                alt_mode = 8 if mode == 3 else 3
+                alt_result = estimate_mle_multistart(res, mode=alt_mode, n_starts=5)
+                if mle_result['log_likelihood'] > alt_result['log_likelihood']:
+                    accuracy_count += 1
             
             results.append({
                 f'male_{selection_type}_fitness': male_fitness,
@@ -1050,13 +1163,18 @@ def run_batch_mle_test(
                 'mean_fit': np.mean(fit_values),
                 f'mean_fit_male_{selection_type}_fitness': np.mean(fit_male_fitness),
                 f'mean_fit_female_{selection_type}_fitness': np.mean(fit_female_fitness),
+                'accuracy': accuracy_count / n_simulations,  # Model sorting accuracy
             })
     
     df = pd.DataFrame(results)
     
-    # Calculate Euclidean distances
+    # Round fitness parameters to 2 decimal places to avoid floating-point precision issues
     male_col = f'male_{selection_type}_fitness'
     female_col = f'female_{selection_type}_fitness'
+    df[male_col] = np.round(df[male_col], 2)
+    df[female_col] = np.round(df[female_col], 2)
+    
+    # Calculate Euclidean distances
     mle_male_col = f'mean_MLE_male_{selection_type}_fitness'
     mle_female_col = f'mean_MLE_female_{selection_type}_fitness'
     fit_male_col = f'mean_fit_male_{selection_type}_fitness'
@@ -1102,6 +1220,16 @@ def run_batch_mle_test(
         x_label=f'Male {selection_type.title()} Fitness',
         y_label=f'Female {selection_type.title()} Fitness',
         value_label='N_e'
+    )
+    
+    # Model sorting accuracy heatmap (acc_v.pdf or acc_f.pdf)
+    plot_heatmap(
+        df, male_col, female_col, 'accuracy',
+        os.path.join(output_dir, f'acc_{selection_type[0]}.pdf'),
+        cmap_low='white', cmap_high='blue',
+        x_label=f'Male {selection_type.title()} Fitness',
+        y_label=f'Female {selection_type.title()} Fitness',
+        value_label='Sorting accuracy'
     )
     
     return df
@@ -1201,8 +1329,10 @@ if __name__ == "__main__":
         # fecundity: fitness from 0.5 to 1.0, step 0.2
         # n_simulations = 3, n_e = 1000, max_week = 10
         
-        viability_fitness_values = np.arange(0.5, 1.01, 0.1)  # [0.5, 0.6, ..., 1.0]
-        fecundity_fitness_values = np.arange(0.5, 1.01, 0.2)  # [0.5, 0.7, 0.9] (matching R's by=0.2)
+        # Use np.round to avoid floating-point precision issues (e.g., 0.7999999...)
+        # np.arange can produce values like 0.79999999 due to binary representation
+        viability_fitness_values = np.round(np.arange(0.5, 1.01, 0.1), 2)  # [0.5, 0.6, ..., 1.0]
+        fecundity_fitness_values = np.round(np.arange(0.5, 1.01, 0.2), 2)  # [0.5, 0.7, 0.9] (matching R's by=0.2)
         
         print("\nViability selection tests...")
         print(f"  Grid: {len(viability_fitness_values)}x{len(viability_fitness_values)} = {len(viability_fitness_values)**2} combinations")
